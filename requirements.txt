@@ -1,0 +1,9 @@
+langchain==0.3.19
+langchain-community==0.3.18
+langchain-openai==0.3.7
+matplotlib==3.10.1
+numpy==1.26.4
+pandas==2.2.3
+streamlit==1.42.2
+sentence-transformers==3.4.1
+chromadb==0.6.3
