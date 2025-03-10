@@ -58,10 +58,10 @@ The scraped Confluence pages are stored in `.md` format in the `md_output` folde
 
 To process the scraped documents and generate attachment summaries, run:
 ```sh
-python process_scraped_docs.py
+python processing_scraped_docs_consolidated_script.py
 ```
 
-- This script generates attachment summaries and saves them in a file named `attachment_path_summary.txt`.
+- This script generates attachment summaries and saves them in a file named `<attachment_path>_summary.txt`.
 - It then creates parent and child retrievers post-chunking.
 
 ## Running the Streamlit Application
@@ -99,7 +99,7 @@ project_root/
 | Activate virtual environment (Windows)   | `venv\Scripts\activate`                 |
 | Install dependencies            | `pip install -r requirements.txt`               |
 | Run scraper                     | `python scrape_docs.py`                         |
-| Process scraped documents       | `python process_scraped_docs.py`                |
+| Process scraped documents       | `python processing_scraped_docs_consolidated_script.py`                |
 | Run Streamlit application       | `streamlit run streamlit_application.py`        |
 
 ## License

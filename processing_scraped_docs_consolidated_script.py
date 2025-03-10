@@ -806,7 +806,7 @@ async def main():
     folder_path = './md_output'  # Change this path as needed
     data_list = extract_structured_data_from_md_files(folder_path)
     # plot_token_histogram(data_list)
-    await generate_attachment_summaries(data_list)
+    # await generate_attachment_summaries(data_list)
     parent_chunks = get_parent_chunks(data_list,parent_chunk_size=1200)
     child_chunks = get_child_chunks(parent_chunks,child_chunk_size=400)
     index_parent_chunks(parent_chunks,db_path="parent_chunks.db")
