@@ -738,56 +738,62 @@ def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model, outpu
                     print(f"Error processing document {data.get('id', '')}: {exc}")
     print(f"Embeddings have been computed and saved to '{output_file_path}'.")
 
-def index_child_embeddings(csv_path = "./child_chunks_400_with_embeddings.csv",batch_size=100,collection_name = "confluence_child_retriever_400"):
+def index_child_embeddings(csv_path="./child_chunks_400_with_embeddings.csv",
+                           batch_size=100,
+                           collection_name="confluence_child_retriever_400"):
 
     class MyEmbeddingFunction(EmbeddingFunction):
         def __init__(self, model_name: str, device: str = "cpu"):
             self.model = HuggingFaceEmbeddings(model_name=model_name, model_kwargs={"device": device})
 
         def __call__(self, input: List[str]) -> List[List[float]]:
-            embeddings = self.model.embed_documents(input)
-            return embeddings.tolist()
+            return self.model.embed_documents(input)
 
     def create_chroma_client():
-        return chromadb.PersistentClient(
-            "./confluence_db_v2"
-        )
+        return chromadb.PersistentClient("./confluence_db_v2")
 
     def process_batch(collection, batch_df):
-        embeddings = batch_df["embeddings"].apply(
+        # Convert embeddings from string to list if necessary
+        batch_df["embeddings"] = batch_df["embeddings"].apply(
             lambda x: ast.literal_eval(x) if isinstance(x, str) else x
-        ).tolist()
-        
-        documents = batch_df["page_content"].tolist()
-        metadatas = batch_df[["title", "parent_id", "source", "attachments"]].to_dict('records')
-        ids = batch_df["id"].astype(str).tolist()
+        )
+
+        #seems like there are nan values in page_content 
+        batch_df = batch_df.dropna(subset=["page_content"])
+        batch_df["page_content"] = batch_df["page_content"].astype(str)
 
         collection.upsert(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-            embeddings=embeddings
+            ids=batch_df["id"].astype(str).tolist(),
+            documents=batch_df["page_content"].tolist(),
+            metadatas=batch_df[["title", "parent_id", "source", "attachments"]].to_dict("records"),
+            embeddings=batch_df["embeddings"].tolist(),
         )
 
     client = create_chroma_client()
     
+    embedding_model = MyEmbeddingFunction(model_name="BAAI/bge-base-en-v1.5", device="cpu")
+    
     collection = client.get_or_create_collection(
         name=collection_name,
-        embedding_function=MyEmbeddingFunction(model_name="BAAI/bge-base-en-v1.5", device="cpu"),
+        embedding_function=embedding_model,
     )
 
     try:
-        with pd.read_csv(csv_path, chunksize=batch_size) as reader:
-            for batch in tqdm(reader, desc="Processing batches"):
-                process_batch(collection, batch)
+        reader = pd.read_csv(csv_path, chunksize=batch_size)
+        for batch in tqdm(reader, desc="Processing batches"):
+            process_batch(collection, batch)
 
-                
     except FileNotFoundError:
         print(f"Error: CSV file not found at {csv_path}")
         return
 
     print(f"Successfully upserted all documents into Chroma DB")
-    vectordb = Chroma(persist_directory="./confluence_db_v2", collection_name=collection_name, embedding_function=embedding_model)
+
+    # Ensure consistent embedding function in Chroma
+    vectordb = Chroma(persist_directory="./confluence_db_v2",
+                      collection_name=collection_name,
+                      embedding_function=embedding_model)
+    
     print(f"Vector Count: {vectordb._collection.count()}")
 
 def clean_and_save_df(df, column="id", output_file="cleaned_data.csv"):
