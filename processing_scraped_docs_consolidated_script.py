@@ -36,11 +36,8 @@ load_dotenv()
 
 multimodal_llm = gpt_4o
 
-# Initialize the tokenizer
-tokenizer = tiktoken.get_encoding('cl100k_base')
-
-# Function to calculate token length
 def tiktoken_len(text):
+    tokenizer = tiktoken.get_encoding('cl100k_base')
     tokens = tokenizer.encode(text, disallowed_special=())
     return len(tokens)
 
@@ -108,6 +105,17 @@ class CustomTablePreservingTextSplitter(RecursiveCharacterTextSplitter):
         """Determine if the text is a Markdown or HTML table."""
         return self._is_markdown_table(text) or self._is_html_table(text)
 
+    def _is_technical_section(self, text: str) -> bool:
+        """Check if text contains technical information that should be kept together."""
+        technical_patterns = [
+            r'password.*=',
+            r'credentials?:',
+            r'authentication.*:',
+            r'config.*{',
+            r'```[a-z]*\n'  # Code blocks
+        ]
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in technical_patterns)
+
     def _split_table_by_rows(self, table_text: str) -> list:
         """Split the table into chunks by rows based on `self._chunk_size`."""
         rows = table_text.split("\n")
@@ -129,7 +137,7 @@ class CustomTablePreservingTextSplitter(RecursiveCharacterTextSplitter):
 
     def split_text(self, text: str) -> list:
         """Override the text-splitting method to handle tables properly."""
-        if self._is_table_chunk(text):
+        if self._is_table_chunk(text) or self._is_technical_section(text):
             if len(text) <= self._chunk_size:
                 return [text]
             else:
@@ -558,7 +566,7 @@ def get_parent_chunks(data_list, parent_chunk_size):
     # Here, we use an overlap equivalent to 20% of the parent_chunk_size.
     parent_splitter = CustomTablePreservingTextSplitter(
         chunk_size=parent_chunk_size,
-        chunk_overlap=int(parent_chunk_size * 0.2),
+        chunk_overlap=int(parent_chunk_size * 0.1),
         separators=["\n\n", "\n", " "]
     )
     

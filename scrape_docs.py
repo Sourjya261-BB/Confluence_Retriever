@@ -30,34 +30,34 @@ def count_processed_pages():
     else:
         return 0
 
-# def get_pages(space_key, start=0, limit=25):
-#     url = f'{CONFLUENCE_URL}/rest/api/content'
-#     params = {
-#         'spaceKey': space_key,
-#         'start': start,
-#         'limit': limit,
-#         'expand': 'body.storage,version'
-#     }
-#     response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-#     response.raise_for_status()
-#     return response.json()
-
 def get_pages(space_key, start=0, limit=25):
     url = f'{CONFLUENCE_URL}/rest/api/content'
     params = {
         'spaceKey': space_key,
         'start': start,
         'limit': limit,
-        'expand': 'body.storage,version',
-        'orderBy': 'version.lastUpdated DESC'  # -> addressed the orderig issue as of friday 28th feb
+        'expand': 'body.storage,version'
     }
     response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-
-    if response.status_code == 400:
-        print(f"Bad Request: {response.text}")  # Print API response for debugging
-
     response.raise_for_status()
     return response.json()
+
+# def get_pages(space_key, start=0, limit=25):
+#     url = f'{CONFLUENCE_URL}/rest/api/content'
+#     params = {
+#         'spaceKey': space_key,
+#         'start': start,
+#         'limit': limit,
+#         'expand': 'body.storage,version',
+#         'orderBy': 'version.lastUpdated DESC'  # -> addressed the orderig issue as of friday 28th feb
+#     }
+#     response = requests.get(url, headers=HEADERS, params=params, auth=auth)
+
+#     if response.status_code == 400:
+#         print(f"Bad Request: {response.text}")  # Print API response for debugging
+
+#     response.raise_for_status()
+#     return response.json()
 
 def get_attachments(page_id):
     url = f'{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment'
@@ -134,10 +134,10 @@ def main():
     start = 0
     limit = 50
     page_count = 0
-    max_pages=1000
+    # max_pages=1000
     print(f"Processed Pages: {count_processed_pages()}")
-    # while True:
-    while page_count < max_pages:
+    while True:
+    # while page_count < max_pages:
         pages_data = get_pages(SPACE_KEY, start=start, limit=limit)
         pages = pages_data['results']
         for page in pages:

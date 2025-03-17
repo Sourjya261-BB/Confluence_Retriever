@@ -34,7 +34,7 @@ gpt_4o = AzureChatOpenAI(
     azure_deployment="gpt-4o",
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_OPENAI_KEY,
-    temperature=0.6,
+    temperature=0.7,
     )
 
 def convert_chroma_response_to_docs(chroma_response):

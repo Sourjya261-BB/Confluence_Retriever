@@ -16,8 +16,16 @@ import asyncio
 from tqdm.asyncio import tqdm
 import torch
 from dotenv import load_dotenv
-from config import PARENT_CHUNKS_DB_PATH
+from config import PARENT_CHUNKS_DB_PATH, TOP_K
 from commons import gpt_35,gpt_4o,get_retriever
+from sentence_transformers import CrossEncoder
+import tiktoken
+import spacy
+from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Load spaCy model - you'll need to install it with: python -m spacy download en_core_web_sm
+nlp = spacy.load("en_core_web_sm")
 
 
 torch.classes.__path__ = []
@@ -25,14 +33,11 @@ torch.classes.__path__ = []
 
 load_dotenv() 
 
-# Environment Variables
+
 os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-# os.environ['LANGCHAIN_TRACING'] = 'true'
 os.environ["LANGCHAIN_PROJECT"] = "Confluence Retriever"
-# os.environ["LANGCHAIN_API_KEY"] = str(os.environ.get("LANGCHAIN_API_KEY"))
 os.environ["LANGSMITH_API_KEY"] = str(os.environ.get("LANGCHAIN_API_KEY"))
 os.environ["LANGSMITH_ENDPOINT"]="https://api.smith.langchain.com"
-# os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
 client = Client()
 
@@ -48,6 +53,11 @@ def extract_json(text):
             print("Error: Invalid JSON format.")
             return None
     return None
+
+def tiktoken_len(text):
+    """Returns the number of tokens in a text using tiktoken."""
+    encoding = tiktoken.get_encoding('cl100k_base')
+    return len(encoding.encode(text))
 
 @traceable( run_type="chain",
     name="Image_processing_agent",
@@ -141,7 +151,7 @@ def convert_doc_to_dict(doc):
     }
     return doc_dict
 
-def retrieve_parent_docs(query,child_chunks_retriever,parent_chunks_db_path):
+async def retrieve_parent_docs(query,child_chunks_retriever,parent_chunks_db_path):
 
     def retrieve_parent_chunk(chunk_id, parent_chunks_db_path):
         """Retrieves a parent chunk based on its ID from SQLite."""
@@ -164,6 +174,65 @@ def retrieve_parent_docs(query,child_chunks_retriever,parent_chunks_db_path):
             }
         return None
     
+    def get_sibling_chunks(parent_id, parent_chunks_db_path):
+        """Get sibling chunks that share the same parent ID prefix"""
+        base_id = parent_id.split('-')[0]  # Get the base ID without chunk number
+        
+        conn = sqlite3.connect(parent_chunks_db_path)
+        cursor = conn.cursor()
+        
+        # Find chunks with the same base ID
+        cursor.execute('SELECT * FROM parent_chunks WHERE id LIKE ?', (f"{base_id}%",))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        siblings = []
+        for row in rows:
+            if row[0] != parent_id:  # Skip the original chunk
+                siblings.append({
+                    "id": row[0],
+                    "title": row[1],
+                    "source": row[2],
+                    "page_content": row[3],
+                    "token_count": row[4],
+                    "attachments": eval(row[5]),
+                    "attachment_summaries": eval(row[6])
+                })
+        
+        return siblings
+
+    async def enrich_with_siblings(parent_doc, siblings, query):
+        """Enrich parent document with relevant content from siblings"""
+        # Simple relevance check - could be enhanced with more sophisticated methods
+        relevant_content = []
+        
+        # query_terms = set(query.lower().split())
+        # query_terms = await extract_keywords_from_query(query,gpt_35)
+        query_terms = extract_keywords(query.lower(),"hybrid")
+        for sibling in siblings:
+            content = sibling["page_content"].lower()
+            # Check if content contains query terms or technical patterns
+            if any(term in content for term in query_terms) or re.search(r'password|credential|token|config', content):
+                relevant_content.append(sibling["page_content"])
+        
+        if relevant_content:
+            # Append relevant content to the parent document
+            parent_doc["page_content"] += "\n\n--- Additional Context ---\n" + "\n\n".join(relevant_content)
+            parent_doc["token_count"] = tiktoken_len(parent_doc["page_content"])
+        
+        return parent_doc
+    
+    async def rerank_parent_docs(query, parent_docs, top_k=TOP_K//2):
+        """Rerank parent documents based on relevance to the query"""
+        reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+        pairs = [[query, doc["page_content"]] for doc in parent_docs]
+
+        scores = reranker.predict(pairs)
+
+        ranked_results = sorted(zip(parent_docs, scores), key=lambda x: x[1], reverse=True)
+        return [doc for doc, score in ranked_results[:top_k]]
+    
     child_docs = child_chunks_retriever.invoke(query)
 
     parent_docs = []
@@ -178,10 +247,15 @@ def retrieve_parent_docs(query,child_chunks_retriever,parent_chunks_db_path):
         else:
             if parent_id not in seen_parents:  # Avoid duplicates
                 parent_doc = retrieve_parent_chunk(parent_id, parent_chunks_db_path)
+                
                 if parent_doc:
+                    siblings = get_sibling_chunks(parent_id, parent_chunks_db_path)
+                    parent_doc = await enrich_with_siblings(parent_doc, siblings, query)
                     parent_docs.append(parent_doc)
                     seen_parents.add(parent_id) 
-
+    
+    if len(parent_docs) > TOP_K//2:
+        parent_docs = await rerank_parent_docs(query, parent_docs)
     return parent_docs  
 
 ### CSV agent:
@@ -271,49 +345,44 @@ def get_total_text_context(data_list):
     return total_text_context
 
 async def generate_keyword_rich_query(user_query, llm):
-    """
-    Enhances a user query by preserving intent while adding relevant keywords for better retrieval.
-
-    Args:
-        user_query (str): The original user query.
-        llm: The language model pipeline.
-
-    Returns:
-        str: The refined, keyword-rich query.
-    """
-
     prompt = f"""
-    You are an expert in query optimization for information retrieval. Your task is to enhance 
-    a given user query by preserving its intent while making it more effective for document retrieval.
-
-    **Instructions:**
-    1. Ensure that the refined query maintains the original **intent** of the user.
-    2. Identify key concepts and entities in the query.
-    3. Augment the query with synonyms, related terms, and domain-specific keywords.
-    4. Avoid changing the meaning or introducing unnecessary complexity.
-    5. Output the enhanced query in **plain text** without additional formatting.
-
-    **Example:**
-    **User Query:** "How do I reset my AWS IAM user password?"
-    **Optimized Query:** "Reset AWS IAM user password, account recovery, credential reset, AWS login issue"
-
-    **User Query:** "{user_query}"
-
-    **Output format:**
+    Analyze the user query and enhance it for better retrieval while maintaining specificity.
+    
+    Guidelines:
+    1. For specific technical queries (passwords, credentials, IDs), preserve the exact terms
+    2. Add only highly relevant technical context
+    3. Maintain the original technical terms in their exact form
+    4. For general queries, expand with relevant synonyms
+    
+    User Query: "{user_query}"
+    
+    Output format:
     ```json
-        {{"output": "optimized query string"}}
+    {{"output": "enhanced query string"}}
     ```
     """
-
     chain = llm | JsonOutputParser()
     response = await chain.ainvoke(prompt)
     return response.get("output", user_query)
 
+async def extract_keywords_from_query(user_query, llm):
+    prompt = f"""
+    Analyze the query and extract the relevant keywords that may be used for search optimization
+    User Query: "{user_query}"
+    
+    Output format:
+    ```json
+    {{"output": ["keyword1","keyword2",...]}}
+    ```
+    """
+    chain = llm | JsonOutputParser()
+    response = await chain.ainvoke(prompt)
+    return response.get("output", [])
 ### Retriever (Main Node):
 async def retrieve_docs(user_query,llm):
-    user_query = await generate_keyword_rich_query(user_query, llm)
+    # user_query = await generate_keyword_rich_query(user_query, llm)
     print("Keyword-rich query:", user_query)
-    docs = retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
+    docs = await retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
     docs = transform_source_links(docs)
     unique_attachment_summaries = filter_unique_attachment_summaries(docs)
     total_text_context = get_total_text_context(docs)
@@ -424,6 +493,8 @@ async def generate_response_for_retrieved_text(total_text_context,user_query,llm
     # result = await llm.ainvoke(prompt)
     # result = result.content.strip()
     # result = extract_json(result)
+    # output = result.content.strip()
+    # final_response["answer"] = output
     final_response["answer"] = result.get('answer', "")
     final_response["sources"] = result.get('sources',[])
     return final_response
@@ -471,51 +542,178 @@ async def generate_response_for_retrieved_attachments(relevant_attachments,user_
 )
 async def generate_combined_context_response(user_query, llm, text_context,attachment_context):
     prompt = f"""
-You have been provided with two sources of information:
-1. **Retrieved Text Context** - Extracted from relevant documents based on the user query.
-2. **Retrieved Attachment Context** - Synthesized from multimodal attachments, such as images, spreadsheets, or other files.
+        You have been provided with two sources of information:
+        1. **Retrieved Text Context** - Extracted from relevant documents based on the user query.
+        2. **Retrieved Attachment Context** - Synthesized from multimodal attachments, such as images, spreadsheets, or other files.
 
-Your task is to **combine insights from both sources** and generate a **concise, accurate, and well-structured answer** to the user query.
+        Your task is to **combine insights from both sources** and generate a **concise, accurate, and well-structured answer** to the user query.
 
-### **User Query:**  
-{user_query}
+        ### **User Query:**  
+        {user_query}
 
-### **Context for Answering:**  
-**Retrieved Text Context:**  
-{text_context}  
+        ### **Context for Answering:**  
+        **Retrieved Text Context:**  
+        {text_context}  
 
-**Retrieved Attachment Context:**  
-{attachment_context}
+        **Retrieved Attachment Context:**  
+        {attachment_context}
 
----
+        ---
 
-### **Guidelines for Answering:**
-1. **Synthesize both sources of information** to form a complete and accurate response.  
-2. **Identify relationships** between textual and multimodal data. You have been provided with the context from the attachments of these retrieved doc. Try to integrate the context from Retrieved Text Context and Retrieved Attachment Context. Both should not be isolated. If you have attachment context refer to the attachment links when you mention about them in the response body. This is extremely important and you will be greatly rewarded if you do thiscorrectly.
-3. **Do NOT hallucinate** or provide information that isn't present in the retrieved data. If unsure, state: `"I don't have enough information to answer this."`  
-4. **Maintain Markdown formatting** for clarity. Use:  
-   - `**bold**` for emphasis.  
-   - `code blocks` for technical details \ flows  
-   - Tables where necessary.  
-5. **Include relevant source links** in the response. Ensure URLs/paths are clearly referenced. Make sure the paths are correct i.e do not forget to mention the file extension in the path.
-6. **Format links properly using named markdown links.**
-Failing to do so would lead to peanlties.
----
-### **Expected Output Format:**
-The response **must be a valid JSON object** following this structure:
-```json
-{{
-    "answer": "Your detailed and well-structured response in .md format here.",
-    "sources": ["List of relevant source URLs or document paths"]
-}}
-```
-"""
+        ### **Guidelines for Answering:**
+        1. **Synthesize both sources of information** to form a complete and accurate response.  
+        2. **Identify relationships** between textual and multimodal data. You have been provided with the context from the attachments of these retrieved doc. Try to integrate the context from Retrieved Text Context and Retrieved Attachment Context. Both should not be isolated. If you have attachment context refer to the attachment links when you mention about them in the response body. This is extremely important and you will be greatly rewarded if you do thiscorrectly.
+        3. **Do NOT hallucinate** or provide information that isn't present in the retrieved data. If unsure, state: `"I don't have enough information to answer this."`  
+        4. **Maintain Markdown formatting** for clarity. Use:  
+        - `**bold**` for emphasis.  
+        - `code blocks` for technical details \ flows  
+        - Tables where necessary.  
+        5. **Include relevant source links** in the response. Ensure URLs/paths are clearly referenced. Make sure the paths are correct i.e do not forget to mention the file extension in the path.
+        6. **Format links properly using named markdown links.**
+        Failing to do so would lead to peanlties.
+        ---
+        ### **Expected Output Format:**
+        The response **must be a valid JSON object** following this structure:
+        ```json
+        {{
+            "answer": "Your detailed and well-structured response in .md format here.",
+            "sources": ["List of relevant source URLs or document paths"]
+        }}
+        ```
+        """
     chain = llm | JsonOutputParser()
     result = await chain.ainvoke(prompt)
     # result = await llm.ainvoke(prompt)
     # result = result.content.strip()
     # result = extract_json(result)
     return result
+
+def extract_keywords(query, method="hybrid"):
+    """
+    Extract meaningful keywords from a query using multiple techniques.
+    
+    Args:
+        query: The user query string
+        method: Extraction method - "spacy", "tfidf", or "hybrid" (default)
+    
+    Returns:
+        List of extracted keywords
+    """
+    # Clean the query
+    clean_query = re.sub(r'[^\w\s]', ' ', query.lower())
+    
+    if method == "spacy":
+        # Use spaCy for linguistic-based extraction
+        doc = nlp(clean_query)
+        
+        # Extract nouns, proper nouns, and technical terms
+        keywords = []
+        for token in doc:
+            # Include nouns and proper nouns
+            if token.pos_ in ["NOUN", "PROPN"]:
+                keywords.append(token.text)
+            
+            # Include verbs that might be technical actions
+            if token.pos_ == "VERB" and len(token.text) > 3:  # Avoid common short verbs
+                keywords.append(token.text)
+                
+        # Extract named entities
+        for ent in doc.ents:
+            keywords.append(ent.text)
+            
+        # Extract noun chunks (noun phrases)
+        for chunk in doc.noun_chunks:
+            keywords.append(chunk.text)
+            
+    elif method == "tfidf":
+        # Use TF-IDF for statistical keyword extraction
+        # This works better with a corpus, but we can use a simple version
+        vectorizer = TfidfVectorizer(
+            max_df=0.9, 
+            min_df=1,
+            stop_words='english',
+            use_idf=True
+        )
+        
+        # Create a small corpus with the query
+        corpus = [clean_query]
+        
+        # Add some general text to help with IDF calculations
+        corpus.extend([
+            "password credentials login authentication",
+            "configuration settings setup installation",
+            "database server network connection",
+            "user account profile settings"
+        ])
+        
+        # Fit and transform
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+        
+        # Get feature names
+        feature_names = vectorizer.get_feature_names_out()
+        
+        # Get scores for the query (first document)
+        scores = tfidf_matrix[0].toarray()[0]
+        
+        # Get top scoring terms
+        top_indices = scores.argsort()[-10:][::-1]  # Get top 10 terms
+        keywords = [feature_names[i] for i in top_indices]
+        
+    else:  # hybrid approach
+        # Combine both methods
+        spacy_keywords = extract_keywords(query, "spacy")
+        tfidf_keywords = extract_keywords(query, "tfidf")
+        
+        # Combine and count occurrences
+        all_keywords = spacy_keywords + tfidf_keywords
+        keyword_counts = Counter(all_keywords)
+        
+        # Get keywords that appear in both methods or have high counts
+        keywords = [k for k, c in keyword_counts.items() if c > 1]
+        
+        # Add any technical terms that might have been missed
+        technical_terms = extract_technical_terms(query)
+        keywords.extend(technical_terms)
+        
+        # If we don't have enough keywords, add top terms from either method
+        if len(keywords) < 3:
+            remaining = set(all_keywords) - set(keywords)
+            keywords.extend(list(remaining)[:5])
+    
+    # Remove duplicates and normalize
+    unique_keywords = []
+    seen = set()
+    for keyword in keywords:
+        normalized = keyword.lower().strip()
+        if normalized and normalized not in seen and len(normalized) > 2:
+            seen.add(normalized)
+            unique_keywords.append(normalized)
+    
+    return unique_keywords
+
+def extract_technical_terms(query):
+    """Extract technical terms that might be missed by other methods"""
+    technical_patterns = [
+        r'password[s]?',
+        r'credential[s]?',
+        r'token[s]?',
+        r'api[_\s]?key[s]?',
+        r'secret[s]?',
+        r'config(?:uration)?[s]?',
+        r'database[s]?|db[s]?',
+        r'server[s]?',
+        r'endpoint[s]?',
+        r'url[s]?',
+        r'[a-zA-Z0-9_]+\.(?:py|js|java|cpp|rb|go|rs|php|html|css|json|yaml|yml|xml|md|txt)'  # file extensions
+    ]
+    
+    technical_terms = []
+    for pattern in technical_patterns:
+        matches = re.finditer(pattern, query, re.IGNORECASE)
+        for match in matches:
+            technical_terms.append(match.group(0))
+    
+    return technical_terms
 
 
 
