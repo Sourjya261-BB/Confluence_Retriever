@@ -25,19 +25,10 @@ OUTPUT_DIR = './md_output'
 
 def count_processed_pages():
     """ Count how many pages have already been processed """
-    return len([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.md')])
-
-def get_pages(space_key, start=0, limit=25):
-    url = f'{CONFLUENCE_URL}/rest/api/content'
-    params = {
-        'spaceKey': space_key,
-        'start': start,
-        'limit': limit,
-        'expand': 'body.storage,version'
-    }
-    response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-    response.raise_for_status()
-    return response.json()
+    if os.path.exists(OUTPUT_DIR):
+        return len([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.md')])
+    else:
+        return 0
 
 # def get_pages(space_key, start=0, limit=25):
 #     url = f'{CONFLUENCE_URL}/rest/api/content'
@@ -45,16 +36,28 @@ def get_pages(space_key, start=0, limit=25):
 #         'spaceKey': space_key,
 #         'start': start,
 #         'limit': limit,
-#         'expand': 'body.storage,version',
-#         'orderBy': 'version.lastUpdated DESC'  # -> addressed the orderig issue as of friday 28th feb
+#         'expand': 'body.storage,version'
 #     }
 #     response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-
-#     if response.status_code == 400:
-#         print(f"Bad Request: {response.text}")  # Print API response for debugging
-
 #     response.raise_for_status()
 #     return response.json()
+
+def get_pages(space_key, start=0, limit=25):
+    url = f'{CONFLUENCE_URL}/rest/api/content'
+    params = {
+        'spaceKey': space_key,
+        'start': start,
+        'limit': limit,
+        'expand': 'body.storage,version',
+        'orderBy': 'version.lastUpdated DESC'  # -> addressed the orderig issue as of friday 28th feb
+    }
+    response = requests.get(url, headers=HEADERS, params=params, auth=auth)
+
+    if response.status_code == 400:
+        print(f"Bad Request: {response.text}")  # Print API response for debugging
+
+    response.raise_for_status()
+    return response.json()
 
 def get_attachments(page_id):
     url = f'{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment'
@@ -114,8 +117,6 @@ def save_page_as_markdown(page):
     content = page['body']['storage']['value']
     source_url = page['_links']['self']
     print(f"source_url:{source_url}")
-
-
     
     # Convert HTML content to Markdown
     markdown_content = markdownify.markdownify(content, heading_style="ATX")
@@ -132,16 +133,16 @@ def save_page_as_markdown(page):
 def main():
     start = 0
     limit = 50
-    # page_count = 0
-    # max_pages=1000
+    page_count = 0
+    max_pages=1000
     print(f"Processed Pages: {count_processed_pages()}")
-    while True:
-    # while page_count < max_pages:
+    # while True:
+    while page_count < max_pages:
         pages_data = get_pages(SPACE_KEY, start=start, limit=limit)
         pages = pages_data['results']
         for page in pages:
             save_page_as_markdown(page)
-            # page_count=page_count+1
+            page_count=page_count+1
         
         if 'next' not in pages_data['_links']:
             break

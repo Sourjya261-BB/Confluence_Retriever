@@ -1,7 +1,8 @@
 import streamlit as st
 import asyncio
 import os
-from retrieval_pipeline_final_consolidated import retrieve_docs,gpt_4o
+from retrieval_pipeline_final_consolidated import retrieve_docs
+from commons import gpt_4o
 
 llm = gpt_4o
 

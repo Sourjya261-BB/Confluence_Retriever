@@ -1,13 +1,10 @@
 import os
 import sqlite3
 import numpy as np
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
 from langsmith import Client 
 from langsmith import traceable
 import base64
 from langchain_core.messages import HumanMessage
-from langchain_community.chat_models import AzureChatOpenAI
 from io import BytesIO
 from PIL import Image
 import pandas as pd
@@ -18,10 +15,13 @@ import re
 import asyncio
 from tqdm.asyncio import tqdm
 import torch
+from dotenv import load_dotenv
+from config import PARENT_CHUNKS_DB_PATH
+from commons import gpt_35,gpt_4o,get_retriever
+
 
 torch.classes.__path__ = []
 
-from dotenv import load_dotenv
 
 load_dotenv() 
 
@@ -36,30 +36,18 @@ os.environ["LANGSMITH_ENDPOINT"]="https://api.smith.langchain.com"
 
 client = Client()
 
-AZURE_OPENAI_VERSION=os.environ.get("AZURE_OPENAI_VERSION")
-AZURE_OPENAI_DEPLOYMENT=os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_ENDPOINT=os.environ.get("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_KEY=os.environ.get("AZURE_OPENAI_KEY")
-AZURE_OPENAI_DEPLOYMENT_GPT4=os.environ.get("AZURE_OPENAI_DEPLOYMENT_GPT4")
+retriever = get_retriever()
 
-gpt_35 = AzureChatOpenAI(
-    openai_api_version=AZURE_OPENAI_VERSION,
-    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    temperature=0.75,
-    )
-
-gpt_4o = AzureChatOpenAI(
-    openai_api_version=AZURE_OPENAI_VERSION,
-    azure_deployment="gpt-4o",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    temperature=0.6,
-    )
-
-embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5", model_kwargs={"device": "cpu"})
-
+def extract_json(text):
+    match = re.search(r'```json\s*({.*})\s*```', text, re.DOTALL)
+    if match:
+        try:
+            json_data = json.loads(match.group(1))
+            return json_data
+        except json.JSONDecodeError:
+            print("Error: Invalid JSON format.")
+            return None
+    return None
 
 @traceable( run_type="chain",
     name="Image_processing_agent",
@@ -67,7 +55,7 @@ embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5", mode
     project_name = "Confluence Retriever",
     metadata={"llm": f"{gpt_4o.model_name}"}
 )
-async def process_image(image_path, title=None, max_size=1024,user_query=None,multimodal_llm=gpt_4o):
+async def process_image(image_path,max_size=1024,user_query=None,multimodal_llm=gpt_4o):
     """Process and summarize images with compression."""
     prompt = f"""
         Given the image you need to answer the user query. Do not be too elaborate with yor answer just try to answer the user query truthfully without making up stuff. It is also possible the the image may not have relevant information. The image url is provided. The name of the image_path might give you some insight in answering the question. If the query is not not too specific try to atleast tell what you gleaned from the image.
@@ -153,18 +141,18 @@ def convert_doc_to_dict(doc):
     }
     return doc_dict
 
-def retrieve_parent_docs(query, embedding_model, vectordb_path="./confluence_db_v2", collection_name="confluence_child_retriever_400", 
-                         db_path="parent_chunks.db", top_k=10):
+def retrieve_parent_docs(query,child_chunks_retriever,parent_chunks_db_path):
 
-    def retrieve_parent_chunk(chunk_id, db_path):
+    def retrieve_parent_chunk(chunk_id, parent_chunks_db_path):
         """Retrieves a parent chunk based on its ID from SQLite."""
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(parent_chunks_db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM parent_chunks WHERE id = ?', (chunk_id,))
         row = cursor.fetchone()
         conn.close()
 
         if row:
+            print("Retrived_parent_doc:",row[3])
             return {
                 "id": row[0],
                 "title": row[1],
@@ -176,22 +164,25 @@ def retrieve_parent_docs(query, embedding_model, vectordb_path="./confluence_db_
             }
         return None
     
-    vectordb = Chroma(persist_directory=vectordb_path, collection_name=collection_name, embedding_function=embedding_model)
-    child_retriever = vectordb.as_retriever(search_type="similarity", search_kwargs={'k': top_k})
-    child_docs = child_retriever.invoke(query)
+    child_docs = child_chunks_retriever.invoke(query)
+
     parent_docs = []
+    seen_parents = set()  # To avoid duplicate parent docs
+
     for child_doc in child_docs:
         parent_id = child_doc.metadata.get('parent_id', None)
 
-        # Check if parent_id is missing or NaN
         if parent_id is None or (isinstance(parent_id, float) and np.isnan(parent_id)):
-            parent_docs.append(convert_doc_to_dict(child_doc))  # Directly add the child doc
+            # Directly add child doc if no parent
+            parent_docs.append(convert_doc_to_dict(child_doc))
         else:
-            parent_doc = retrieve_parent_chunk(parent_id, db_path)
-            if parent_doc:
-                parent_docs.append(parent_doc)
+            if parent_id not in seen_parents:  # Avoid duplicates
+                parent_doc = retrieve_parent_chunk(parent_id, parent_chunks_db_path)
+                if parent_doc:
+                    parent_docs.append(parent_doc)
+                    seen_parents.add(parent_id) 
 
-    return parent_docs
+    return parent_docs  
 
 ### CSV agent:
 @traceable( run_type="chain",
@@ -240,7 +231,7 @@ async def generate_image_agent_output(user_query, multimodal_llm, image_url):
     query = f"""Based on the image provided try to answer the user query: {user_query}
             Do not generate irrelevent details. If the image does not have relevant context then just return that the image_url does not have relevant context.
     """
-    return await process_image(image_url, query, multimodal_llm)
+    return await process_image(image_url, 1024, query, multimodal_llm)
 
 def transform_source_links(data_list):
     updated_data_list = []
@@ -279,17 +270,61 @@ def get_total_text_context(data_list):
             total_text_context.append(context)
     return total_text_context
 
+async def generate_keyword_rich_query(user_query, llm):
+    """
+    Enhances a user query by preserving intent while adding relevant keywords for better retrieval.
+
+    Args:
+        user_query (str): The original user query.
+        llm: The language model pipeline.
+
+    Returns:
+        str: The refined, keyword-rich query.
+    """
+
+    prompt = f"""
+    You are an expert in query optimization for information retrieval. Your task is to enhance 
+    a given user query by preserving its intent while making it more effective for document retrieval.
+
+    **Instructions:**
+    1. Ensure that the refined query maintains the original **intent** of the user.
+    2. Identify key concepts and entities in the query.
+    3. Augment the query with synonyms, related terms, and domain-specific keywords.
+    4. Avoid changing the meaning or introducing unnecessary complexity.
+    5. Output the enhanced query in **plain text** without additional formatting.
+
+    **Example:**
+    **User Query:** "How do I reset my AWS IAM user password?"
+    **Optimized Query:** "Reset AWS IAM user password, account recovery, credential reset, AWS login issue"
+
+    **User Query:** "{user_query}"
+
+    **Output format:**
+    ```json
+        {{"output": "optimized query string"}}
+    ```
+    """
+
+    chain = llm | JsonOutputParser()
+    response = await chain.ainvoke(prompt)
+    return response.get("output", user_query)
+
 ### Retriever (Main Node):
 async def retrieve_docs(user_query,llm):
-    docs = retrieve_parent_docs(user_query,embedding_model,top_k=15)
+    user_query = await generate_keyword_rich_query(user_query, llm)
+    print("Keyword-rich query:", user_query)
+    docs = retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
     docs = transform_source_links(docs)
     unique_attachment_summaries = filter_unique_attachment_summaries(docs)
     total_text_context = get_total_text_context(docs)
     print(f"Number of attachments retrived: {len(unique_attachment_summaries)}")
-    relevant_attachments = await filter_relevant_attachments(unique_attachment_summaries,user_query,llm) ### Node 2
-    print(f"Number of relevant attachments: {len(relevant_attachments)}\n Relevant attachments: {relevant_attachments}")
-    text_response = await generate_response_for_retrieved_text(total_text_context,user_query,llm) ### Node 3
-    print(f"Text processing response: {text_response}")
+    relevant_attachments_task = filter_relevant_attachments(unique_attachment_summaries, user_query, llm)
+    text_response_task = generate_response_for_retrieved_text(total_text_context, user_query, llm)
+
+    relevant_attachments, text_response = await asyncio.gather(
+        relevant_attachments_task, 
+        text_response_task
+    )
     attachment_response = await generate_response_for_retrieved_attachments(relevant_attachments,user_query,llm) ### Node 4 (may spawn multiple parallel nodes)
     print(f"Attachment processing response: {attachment_response}")
     combined_response = await generate_combined_context_response(user_query, gpt_4o, text_response, attachment_response) ### Node 5
@@ -372,6 +407,7 @@ async def generate_response_for_retrieved_text(total_text_context,user_query,llm
     2. Include the relevant source URL in the specified format in your answer. Mention these links/paths in the answer as well.
     3. If the retrieved context contains code or tables, include them in the output and add explanatory text.
     4. Always produce the source link in the answer and ask the user to refer to it for further information.
+    5. If the retrieved context is relevant then try to make the answer as detailed and well structured as possible (md format).
 
     Output Format:
 
@@ -379,26 +415,15 @@ async def generate_response_for_retrieved_text(total_text_context,user_query,llm
     ```json
     {{  
         "answer": "your detailed answer in **.md** format here",
-        "sources": ["source URL1,"source URL2"...]
+        "sources": ["source URL1","source URL2"...]
     }}
     ```
     """
     chain = llm | JsonOutputParser()
-    # result = await llm.ainvoke(prompt)
     result = await chain.ainvoke(prompt)
+    # result = await llm.ainvoke(prompt)
     # result = result.content.strip()
-    # print(result)
-    # try:
-    #     # Extract JSON blocks between ```json ... ```
-    #     json_matches = re.findall(r'```json\s*({.*?})\s*```', result, re.DOTALL)
-    #     json_data = [json.loads(match) for match in json_matches]
-    #     final_response["answer"] = json_data[0].get('answer', "")
-    #     final_response["sources"] = json_data[0].get('sources',[])
-    #     return final_response
-
-    # except (json.JSONDecodeError, IndexError):
-    #     print("Error in parsing llm_output")
-    #     return final_response
+    # result = extract_json(result)
     final_response["answer"] = result.get('answer', "")
     final_response["sources"] = result.get('sources',[])
     return final_response
@@ -473,6 +498,7 @@ Your task is to **combine insights from both sources** and generate a **concise,
    - `code blocks` for technical details \ flows  
    - Tables where necessary.  
 5. **Include relevant source links** in the response. Ensure URLs/paths are clearly referenced. Make sure the paths are correct i.e do not forget to mention the file extension in the path.
+6. **Format links properly using named markdown links.**
 Failing to do so would lead to peanlties.
 ---
 ### **Expected Output Format:**
@@ -486,19 +512,10 @@ The response **must be a valid JSON object** following this structure:
 """
     chain = llm | JsonOutputParser()
     result = await chain.ainvoke(prompt)
-    return result
     # result = await llm.ainvoke(prompt)
     # result = result.content.strip()
-    # try:
-    #     # Extract JSON blocks between ```json ... ```
-    #     json_matches = re.findall(r'>```json\s*({.*?})\s*```<', result, re.DOTALL)
-    #     json_data = [json.loads(match) for match in json_matches]
-    #     final_response["answer"] = json_data[0].get('answer', "")
-    #     final_response["sources"] = json_data[0].get('sources',[])
-    #     return final_response
-
-    # except (json.JSONDecodeError, IndexError):
-    #     return final_response
+    # result = extract_json(result)
+    return result
 
 
 
