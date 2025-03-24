@@ -1,65 +1,71 @@
 import os
-import sqlite3
-import numpy as np
-from langchain.vectorstores import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
-from langsmith import Client 
-from langsmith import traceable
+import sys
+import tiktoken
+import spacy
+import json
+import re
+import torch
+import asyncio
 import base64
-from langchain_core.messages import HumanMessage
-from langchain_community.chat_models import AzureChatOpenAI
 from io import BytesIO
 from PIL import Image
 import pandas as pd
-from langchain_core.output_parsers import JsonOutputParser
+from langsmith import Client 
+from langsmith import traceable
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from typing import List, Dict
-import json
-import re
-import asyncio
 from tqdm.asyncio import tqdm
-import torch
+from dotenv import load_dotenv
+
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PARENT_CHUNKS_DB_PATH, TOP_K, KEYWORD_EXTRACTION_MODE, RETRIEVER_MECHANISM 
+from commons import gpt_35,gpt_4o,get_retriever
+from retrieval_helpers.parent_doc_retrieval_utils import SimpleParentDocRetriever,ComplexParentDocRetriever,ChildDocRetriever
+from retrieval_helpers.common_utils import transform_source_links
+# Load spaCy model - you'll need to install it with: python -m spacy download en_core_web_sm
 
 torch.classes.__path__ = []
 
-from dotenv import load_dotenv
 
 load_dotenv() 
 
-# Environment Variables
+
 os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-# os.environ['LANGCHAIN_TRACING'] = 'true'
 os.environ["LANGCHAIN_PROJECT"] = "Confluence Retriever"
-# os.environ["LANGCHAIN_API_KEY"] = str(os.environ.get("LANGCHAIN_API_KEY"))
 os.environ["LANGSMITH_API_KEY"] = str(os.environ.get("LANGCHAIN_API_KEY"))
 os.environ["LANGSMITH_ENDPOINT"]="https://api.smith.langchain.com"
-# os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
 client = Client()
 
-AZURE_OPENAI_VERSION=os.environ.get("AZURE_OPENAI_VERSION")
-AZURE_OPENAI_DEPLOYMENT=os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_ENDPOINT=os.environ.get("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_KEY=os.environ.get("AZURE_OPENAI_KEY")
-AZURE_OPENAI_DEPLOYMENT_GPT4=os.environ.get("AZURE_OPENAI_DEPLOYMENT_GPT4")
+child_retriever = get_retriever()
 
-gpt_35 = AzureChatOpenAI(
-    openai_api_version=AZURE_OPENAI_VERSION,
-    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    temperature=0.75,
-    )
+class RobustJsonOutputParser(JsonOutputParser):
+    def parse(self, text: str):
+        try:
+            return super().parse(text)
+        
+        except Exception as original_error:
 
-gpt_4o = AzureChatOpenAI(
-    openai_api_version=AZURE_OPENAI_VERSION,
-    azure_deployment="gpt-4o",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    temperature=0.6,
-    )
+            print(f"first round of parsing failed due to error:{original_error}")
+            try:
+                first_brace = text.find('{')
+                last_brace = text.rfind('}')
+                
+                if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+                    json_str = text[first_brace:last_brace+1]
+                    return json.loads(json_str)
 
-embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5", model_kwargs={"device": "cpu"})
+            except Exception as secondary_error:
 
+                raise secondary_error
+            raise original_error
+
+def tiktoken_len(text):
+    """Returns the number of tokens in a text using tiktoken."""
+    encoding = tiktoken.get_encoding('cl100k_base')
+    return len(encoding.encode(text))
 
 @traceable( run_type="chain",
     name="Image_processing_agent",
@@ -67,7 +73,7 @@ embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5", mode
     project_name = "Confluence Retriever",
     metadata={"llm": f"{gpt_4o.model_name}"}
 )
-async def process_image(image_path, title=None, max_size=1024,user_query=None,multimodal_llm=gpt_4o):
+async def process_image(image_path,max_size=1024,user_query=None,multimodal_llm=gpt_4o):
     """Process and summarize images with compression."""
     prompt = f"""
         Given the image you need to answer the user query. Do not be too elaborate with yor answer just try to answer the user query truthfully without making up stuff. It is also possible the the image may not have relevant information. The image url is provided. The name of the image_path might give you some insight in answering the question. If the query is not not too specific try to atleast tell what you gleaned from the image.
@@ -141,57 +147,6 @@ def process_spreadsheet(file_path):
         print(f"Error processing spreadsheet {file_path}: {e}")
         return None
 
-def convert_doc_to_dict(doc):
-    doc_dict = { 
-        "id": f"{doc.metadata.get('id', '')}",
-        "title": doc.metadata.get("title", ""),
-        "source": doc.metadata.get("source", ""),
-        "page_content": doc.page_content,
-        "token_count": doc.metadata.get("token_count", 0),
-        "attachments": doc.metadata.get("attachments", []),
-        "attachment_summaries": doc.metadata.get("attachment_summaries", {})
-    }
-    return doc_dict
-
-def retrieve_parent_docs(query, embedding_model, vectordb_path="./confluence_db_v2", collection_name="confluence_child_retriever_400", 
-                         db_path="parent_chunks.db", top_k=10):
-
-    def retrieve_parent_chunk(chunk_id, db_path):
-        """Retrieves a parent chunk based on its ID from SQLite."""
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM parent_chunks WHERE id = ?', (chunk_id,))
-        row = cursor.fetchone()
-        conn.close()
-
-        if row:
-            return {
-                "id": row[0],
-                "title": row[1],
-                "source": row[2],
-                "page_content": row[3],
-                "token_count": row[4],
-                "attachments": eval(row[5]),  # Convert stored string back to list
-                "attachment_summaries": eval(row[6])  # Convert stored string back to dict
-            }
-        return None
-    
-    vectordb = Chroma(persist_directory=vectordb_path, collection_name=collection_name, embedding_function=embedding_model)
-    child_retriever = vectordb.as_retriever(search_type="similarity", search_kwargs={'k': top_k})
-    child_docs = child_retriever.invoke(query)
-    parent_docs = []
-    for child_doc in child_docs:
-        parent_id = child_doc.metadata.get('parent_id', None)
-
-        # Check if parent_id is missing or NaN
-        if parent_id is None or (isinstance(parent_id, float) and np.isnan(parent_id)):
-            parent_docs.append(convert_doc_to_dict(child_doc))  # Directly add the child doc
-        else:
-            parent_doc = retrieve_parent_chunk(parent_id, db_path)
-            if parent_doc:
-                parent_docs.append(parent_doc)
-
-    return parent_docs
 
 ### CSV agent:
 @traceable( run_type="chain",
@@ -234,13 +189,12 @@ async def generate_simple_csv_agent_output(user_query, llm, df_dict):
     chain = llm | JsonOutputParser()
     response = await chain.ainvoke(prompt)
     return response
-    
 ### Image Agent:
 async def generate_image_agent_output(user_query, multimodal_llm, image_url):
     query = f"""Based on the image provided try to answer the user query: {user_query}
             Do not generate irrelevent details. If the image does not have relevant context then just return that the image_url does not have relevant context.
     """
-    return await process_image(image_url, query, multimodal_llm)
+    return await process_image(image_url, 1024, query, multimodal_llm)
 
 def transform_source_links(data_list):
     updated_data_list = []
@@ -279,21 +233,61 @@ def get_total_text_context(data_list):
             total_text_context.append(context)
     return total_text_context
 
+async def generate_keyword_rich_query(user_query, llm):
+    prompt = f"""
+    Analyze the user query and enhance it for better retrieval while maintaining specificity.
+    
+    Guidelines:
+    1. For specific technical queries (passwords, credentials, IDs), preserve the exact terms
+    2. Add only highly relevant technical context
+    3. Maintain the original technical terms in their exact form
+    4. For general queries, expand with relevant synonyms
+    
+    User Query: "{user_query}"
+    
+    Output format:
+    ```json
+    {{"output": "enhanced query string"}}
+    ```
+    """
+    chain = llm | JsonOutputParser()
+    response = await chain.ainvoke(prompt)
+    return response.get("output", user_query)
+
 ### Retriever (Main Node):
 async def retrieve_docs(user_query,llm):
-    docs = retrieve_parent_docs(user_query,embedding_model,top_k=15)
+    # user_query = await generate_keyword_rich_query(user_query, llm)
+    print("Keyword-rich query:", user_query)
+    # docs = await retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
+    if RETRIEVER_MECHANISM=="complex_parent":
+        parent_retriever = ComplexParentDocRetriever(PARENT_CHUNKS_DB_PATH,TOP_K//2,KEYWORD_EXTRACTION_MODE)
+        docs = parent_retriever.retrieve_parent_docs(user_query,child_retriever)
+    elif RETRIEVER_MECHANISM=="simple_parent":
+        parent_retriever = SimpleParentDocRetriever(PARENT_CHUNKS_DB_PATH,TOP_K//2,KEYWORD_EXTRACTION_MODE)
+        docs = parent_retriever.retrieve_parent_docs(user_query,child_retriever)
+    elif RETRIEVER_MECHANISM=="child":
+        child_docs_retriever = ChildDocRetriever(TOP_K)
+        docs = child_docs_retriever.retrieve_child_docs(user_query,child_retriever)
+
+    print(docs)
+    # docs = retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
     docs = transform_source_links(docs)
-    unique_attachment_summaries = filter_unique_attachment_summaries(docs)
+    # unique_attachment_summaries = filter_unique_attachment_summaries(docs)
     total_text_context = get_total_text_context(docs)
-    print(f"Number of attachments retrived: {len(unique_attachment_summaries)}")
-    relevant_attachments = await filter_relevant_attachments(unique_attachment_summaries,user_query,llm) ### Node 2
-    print(f"Number of relevant attachments: {len(relevant_attachments)}\n Relevant attachments: {relevant_attachments}")
-    text_response = await generate_response_for_retrieved_text(total_text_context,user_query,llm) ### Node 3
-    print(f"Text processing response: {text_response}")
-    attachment_response = await generate_response_for_retrieved_attachments(relevant_attachments,user_query,llm) ### Node 4 (may spawn multiple parallel nodes)
-    print(f"Attachment processing response: {attachment_response}")
-    combined_response = await generate_combined_context_response(user_query, gpt_4o, text_response, attachment_response) ### Node 5
-    return combined_response
+    text_response  = await generate_response_for_retrieved_text(total_text_context,user_query,llm)
+    return text_response
+    # print(f"Number of attachments retrived: {len(unique_attachment_summaries)}")
+    # relevant_attachments_task = filter_relevant_attachments(unique_attachment_summaries, user_query, llm)
+    # text_response_task = generate_response_for_retrieved_text(total_text_context, user_query, llm)
+
+    # relevant_attachments, text_response = await asyncio.gather(
+    #     relevant_attachments_task, 
+    #     text_response_task
+    # )
+    # attachment_response = await generate_response_for_retrieved_attachments(relevant_attachments,user_query,llm) ### Node 4 (may spawn multiple parallel nodes)
+    # print(f"Attachment processing response: {attachment_response}")
+    # combined_response = await generate_combined_context_response(user_query, gpt_4o, text_response, attachment_response) ### Node 5
+    # return combined_response
     
 ### Choose resources:
 @traceable( run_type="chain",
@@ -370,35 +364,26 @@ async def generate_response_for_retrieved_text(total_text_context,user_query,llm
 
     1. Answer the user query truthfully. If you do not know the answer, state that you do not know.
     2. Include the relevant source URL in the specified format in your answer. Mention these links/paths in the answer as well.
-    3. If the retrieved context contains code or tables, include them in the output and add explanatory text.
-    4. Always produce the source link in the answer and ask the user to refer to it for further information.
+    3. If the retrieved context contains code or tables, include them in the output and add explanatory text. You will be rewarded for providing code along with explanation in the response.
+    4. Always produce the source link in the answer and ask the user to refer to it for further information. The source links must always bear the title of the source. 
+    5. If the retrieved context is relevant then try to make the answer as detailed and well structured as possible (md format). Be extensive with the detail you will be rewarded for it. 
 
     Output Format:
 
     The output must be a JSON object in the following format:
     ```json
+    {{"output":
     {{  
         "answer": "your detailed answer in **.md** format here",
-        "sources": ["source URL1,"source URL2"...]
+        "sources": ["source URL1","source URL2"...]
+    }}
     }}
     ```
     """
-    chain = llm | JsonOutputParser()
-    # result = await llm.ainvoke(prompt)
+    chain = llm | RobustJsonOutputParser()
     result = await chain.ainvoke(prompt)
-    # result = result.content.strip()
-    # print(result)
-    # try:
-    #     # Extract JSON blocks between ```json ... ```
-    #     json_matches = re.findall(r'```json\s*({.*?})\s*```', result, re.DOTALL)
-    #     json_data = [json.loads(match) for match in json_matches]
-    #     final_response["answer"] = json_data[0].get('answer', "")
-    #     final_response["sources"] = json_data[0].get('sources',[])
-    #     return final_response
-
-    # except (json.JSONDecodeError, IndexError):
-    #     print("Error in parsing llm_output")
-    #     return final_response
+    print(result)
+    result = result.get("output",{})
     final_response["answer"] = result.get('answer', "")
     final_response["sources"] = result.get('sources',[])
     return final_response
@@ -446,60 +431,51 @@ async def generate_response_for_retrieved_attachments(relevant_attachments,user_
 )
 async def generate_combined_context_response(user_query, llm, text_context,attachment_context):
     prompt = f"""
-You have been provided with two sources of information:
-1. **Retrieved Text Context** - Extracted from relevant documents based on the user query.
-2. **Retrieved Attachment Context** - Synthesized from multimodal attachments, such as images, spreadsheets, or other files.
+        You have been provided with two sources of information:
+        1. **Retrieved Text Context** - Extracted from relevant documents based on the user query.
+        2. **Retrieved Attachment Context** - Synthesized from multimodal attachments, such as images, spreadsheets, or other files.
 
-Your task is to **combine insights from both sources** and generate a **concise, accurate, and well-structured answer** to the user query.
+        Your task is to **combine insights from both sources** and generate a **concise, accurate, and well-structured answer** to the user query.
 
-### **User Query:**  
-{user_query}
+        ### **User Query:**  
+        {user_query}
 
-### **Context for Answering:**  
-**Retrieved Text Context:**  
-{text_context}  
+        ### **Context for Answering:**  
+        **Retrieved Text Context:**  
+        {text_context}  
 
-**Retrieved Attachment Context:**  
-{attachment_context}
+        **Retrieved Attachment Context:**  
+        {attachment_context}
 
----
+        ---
 
-### **Guidelines for Answering:**
-1. **Synthesize both sources of information** to form a complete and accurate response.  
-2. **Identify relationships** between textual and multimodal data. You have been provided with the context from the attachments of these retrieved doc. Try to integrate the context from Retrieved Text Context and Retrieved Attachment Context. Both should not be isolated. If you have attachment context refer to the attachment links when you mention about them in the response body. This is extremely important and you will be greatly rewarded if you do thiscorrectly.
-3. **Do NOT hallucinate** or provide information that isn't present in the retrieved data. If unsure, state: `"I don't have enough information to answer this."`  
-4. **Maintain Markdown formatting** for clarity. Use:  
-   - `**bold**` for emphasis.  
-   - `code blocks` for technical details \ flows  
-   - Tables where necessary.  
-5. **Include relevant source links** in the response. Ensure URLs/paths are clearly referenced. Make sure the paths are correct i.e do not forget to mention the file extension in the path.
-Failing to do so would lead to peanlties.
----
-### **Expected Output Format:**
-The response **must be a valid JSON object** following this structure:
-```json
-{{
-    "answer": "Your detailed and well-structured response in .md format here.",
-    "sources": ["List of relevant source URLs or document paths"]
-}}
-```
-"""
+        ### **Guidelines for Answering:**
+        1. **Synthesize both sources of information** to form a complete and accurate response.  
+        2. **Identify relationships** between textual and multimodal data. You have been provided with the context from the attachments of these retrieved doc. Try to integrate the context from Retrieved Text Context and Retrieved Attachment Context. Both should not be isolated. If you have attachment context refer to the attachment links when you mention about them in the response body. This is extremely important and you will be greatly rewarded if you do thiscorrectly.
+        3. **Do NOT hallucinate** or provide information that isn't present in the retrieved data. If unsure, state: `"I don't have enough information to answer this."`  
+        4. **Maintain Markdown formatting** for clarity. Use:  
+        - `**bold**` for emphasis.  
+        - `code blocks` for technical details \ flows  
+        - Tables where necessary.  
+        5. **Include relevant source links** in the response. Ensure URLs/paths are clearly referenced. Make sure the paths are correct i.e do not forget to mention the file extension in the path.
+        6. **Format links properly using named markdown links.**
+        Failing to do so would lead to peanlties.
+        ---
+        ### **Expected Output Format:**
+        The response **must be a valid JSON object** following this structure:
+        ```json
+        {{
+            "answer": "Your detailed and well-structured response in .md format here.",
+            "sources": ["List of relevant source URLs or document paths"]
+        }}
+        ```
+        """
     chain = llm | JsonOutputParser()
     result = await chain.ainvoke(prompt)
-    return result
     # result = await llm.ainvoke(prompt)
     # result = result.content.strip()
-    # try:
-    #     # Extract JSON blocks between ```json ... ```
-    #     json_matches = re.findall(r'>```json\s*({.*?})\s*```<', result, re.DOTALL)
-    #     json_data = [json.loads(match) for match in json_matches]
-    #     final_response["answer"] = json_data[0].get('answer', "")
-    #     final_response["sources"] = json_data[0].get('sources',[])
-    #     return final_response
-
-    # except (json.JSONDecodeError, IndexError):
-    #     return final_response
-
+    # result = extract_json(result)
+    return result
 
 
 

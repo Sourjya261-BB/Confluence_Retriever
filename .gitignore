@@ -1,2 +1,5 @@
 .env
 md_output/
+venv/
+__pycache__/
+.cursorignore

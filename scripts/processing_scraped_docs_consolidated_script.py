@@ -1,61 +1,49 @@
 import os
+import sys
+import re
+import ast 
+import csv
 import hashlib
 import tiktoken
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
+import sqlite3
+import asyncio
 import base64
+import string
+import random
+import chromadb
+import chardet
+import pandas as pd
 from io import BytesIO
 from PIL import Image
-import pandas as pd
-import chardet
-import fitz  
-from langchain_core.messages import HumanMessage
-from langchain_community.chat_models import AzureChatOpenAI
+import faulthandler
+from tqdm import tqdm
+import seaborn as sns
+from typing import List
+import concurrent.futures
 from docx import Document 
 from dotenv import load_dotenv
-import faulthandler
-import asyncio
-from langchain_chroma import Chroma
-from langchain.embeddings import HuggingFaceEmbeddings
-import concurrent.futures
-import csv
-import sqlite3
-import ast 
-import chromadb
+import matplotlib.pyplot as plt
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
 from chromadb.utils.embedding_functions import EmbeddingFunction
-from typing import List
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+from commons import embedding_model,gpt_35, gpt_4o
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import PARENT_CHUNK_SIZE, CHILD_CHUNK_SIZE, MD_FOLDER_PATH, PARENT_CHUNKS_DB_PATH, CHILD_CHUNKS_CSV_FILE_PATH, CLEANED_CHILD_CHUNKS_CSV_FILE_PATH, COLLECTION_NAME, VECTORDB_PATH, EMBEDDING_MODEL_NAME,SOS,AUGMENTED_CHUNKING, RETRIEVAL_MODE,SOS_PATTERNS
 
-
-embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5", 
-                                                     model_kwargs={"device": "cpu"})
 
 
 faulthandler.enable() #Im using this for tracking where the code breaks....have found many malformed pdf attachments.
 
 load_dotenv() 
 
-#openAI env variabls
-AZURE_OPENAI_VERSION=os.environ.get("AZURE_OPENAI_VERSION")
-AZURE_OPENAI_DEPLOYMENT=os.environ.get("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_ENDPOINT=os.environ.get("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_KEY=os.environ.get("AZURE_OPENAI_KEY")
-AZURE_OPENAI_DEPLOYMENT_GPT4=os.environ.get("AZURE_OPENAI_DEPLOYMENT_GPT4")
+multimodal_llm = gpt_4o
 
-multimodal_llm = AzureChatOpenAI(
-    openai_api_version=AZURE_OPENAI_VERSION,
-    azure_deployment="gpt-4o",
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_KEY,
-    temperature=0.8,
-    )
-
-# Initialize the tokenizer
-tokenizer = tiktoken.get_encoding('cl100k_base')
-
-# Function to calculate token length
 def tiktoken_len(text):
+    tokenizer = tiktoken.get_encoding('cl100k_base')
     tokens = tokenizer.encode(text, disallowed_special=())
     return len(tokens)
 
@@ -63,62 +51,108 @@ def tiktoken_len(text):
 def generate_id(source_url):
     return int(hashlib.sha256(source_url.encode('utf-8')).hexdigest(), 16) % 10**8
 
-# Function to chunk the page content into pieces not exceeding max_tokens
-# def chunk_content(text, max_tokens=10000):
+def generate_random_string(length=10):
+    characters = string.ascii_letters + string.digits  # Letters (a-z, A-Z) and digits (0-9)
+    return ''.join(random.choices(characters, k=length))
+
+# def chunk_content(text, max_tokens=10000, overlap_percent=10):
+#     """
+#     Chunk text into pieces not exceeding max_tokens with a specified overlap percentage.
+    
+#     Args:
+#         text (str): The text to chunk
+#         max_tokens (int): Maximum number of tokens per chunk
+#         overlap_percent (int): Percentage of tokens to overlap between chunks
+        
+#     Returns:
+#         list: List of text chunks with overlap
+#     """
 #     tokens = tokenizer.encode(text, disallowed_special=())
 #     chunks = []
+    
+#     # Calculate overlap size in tokens
+#     overlap_size = int(max_tokens * (overlap_percent / 100))
+    
+#     # Adjust step size based on overlap
+#     step_size = max_tokens - overlap_size
+    
+#     # Edge case: if step_size becomes too small or negative
+#     if step_size <= 0:
+#         step_size = max(1, max_tokens // 2)
+#         overlap_size = max_tokens - step_size
+    
 #     start = 0
 #     while start < len(tokens):
+#         # Calculate end position for current chunk
 #         end = min(start + max_tokens, len(tokens))
+        
+#         # Get tokens for this chunk
 #         chunk_tokens = tokens[start:end]
+        
+#         # Decode tokens back to text
 #         chunk_text = tokenizer.decode(chunk_tokens)
+        
+#         # Add chunk to results
 #         chunks.append(chunk_text)
-#         start = end
+        
+#         # Move start position for next chunk, accounting for overlap
+#         start += step_size
+    
 #     return chunks
-def chunk_content(text, max_tokens=10000, overlap_percent=10):
-    """
-    Chunk text into pieces not exceeding max_tokens with a specified overlap percentage.
-    
-    Args:
-        text (str): The text to chunk
-        max_tokens (int): Maximum number of tokens per chunk
-        overlap_percent (int): Percentage of tokens to overlap between chunks
-        
-    Returns:
-        list: List of text chunks with overlap
-    """
-    tokens = tokenizer.encode(text, disallowed_special=())
-    chunks = []
-    
-    # Calculate overlap size in tokens
-    overlap_size = int(max_tokens * (overlap_percent / 100))
-    
-    # Adjust step size based on overlap
-    step_size = max_tokens - overlap_size
-    
-    # Edge case: if step_size becomes too small or negative
-    if step_size <= 0:
-        step_size = max(1, max_tokens // 2)
-        overlap_size = max_tokens - step_size
-    
-    start = 0
-    while start < len(tokens):
-        # Calculate end position for current chunk
-        end = min(start + max_tokens, len(tokens))
-        
-        # Get tokens for this chunk
-        chunk_tokens = tokens[start:end]
-        
-        # Decode tokens back to text
-        chunk_text = tokenizer.decode(chunk_tokens)
-        
-        # Add chunk to results
-        chunks.append(chunk_text)
-        
-        # Move start position for next chunk, accounting for overlap
-        start += step_size
-    
-    return chunks
+class CustomTablePreservingTextSplitter(RecursiveCharacterTextSplitter):
+    def _is_markdown_table(self, text: str) -> bool:
+        """Check if the given text is a Markdown table."""
+        pattern = r'\|.*\|\s*\n\|[-: ]+\|'
+        return bool(re.search(pattern, text))
+
+    def _is_html_table(self, text: str) -> bool:
+        """Check if the given text is an HTML table."""
+        return "<table" in text and "</table>" in text
+
+    def _is_table_chunk(self, text: str) -> bool:
+        """Determine if the text is a Markdown or HTML table."""
+        return self._is_markdown_table(text) or self._is_html_table(text)
+
+    def _is_technical_section(self, text: str) -> bool:
+        """Check if text contains technical information that should be kept together."""
+        technical_patterns = [
+            r'password.*=',
+            r'credentials?:',
+            r'authentication.*:',
+            r'config.*{',
+            r'```[a-z]*\n'  # Code blocks
+        ]
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in technical_patterns)
+
+    def _split_table_by_rows(self, table_text: str) -> list:
+        """Split the table into chunks by rows based on `self._chunk_size`."""
+        rows = table_text.split("\n")
+        chunks = []
+        current_chunk = ""
+
+        for row in rows:
+            candidate = (current_chunk + "\n" + row) if current_chunk else row
+            if len(candidate) > self._chunk_size:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = row
+            else:
+                current_chunk = candidate
+
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    def split_text(self, text: str) -> list:
+        """Override the text-splitting method to handle tables properly."""
+        if self._is_table_chunk(text) or self._is_technical_section(text):
+            if len(text) <= self._chunk_size:
+                return [text]
+            else:
+                return self._split_table_by_rows(text)
+        return super().split_text(text)
+
+
 
 def extract_structured_data_from_md_files(folder_path):
     data_list = []
@@ -146,7 +180,11 @@ def extract_structured_data_from_md_files(folder_path):
                 source = content[source_start:source_end].strip()
                 
                 # Generate ID from the source URL
-                id = generate_id(source)
+                if source=="":
+                    print(f"Could not find source for title {title}")
+                    id = generate_id(generate_random_string(10))
+                else:
+                    id = generate_id(title)
                 
                 # Extract Page Content
                 page_content_start = content.find("### Page_content:") + len("### Page_content:")
@@ -164,8 +202,14 @@ def extract_structured_data_from_md_files(folder_path):
                     'page_content': page_content,
                     'token_count': token_count
                 }
-                
-                data_list.append(data)
+
+                if SOS:
+                    title = data.get("title","")
+                    title_lower = title.lower()
+                    if any(pattern in title_lower for pattern in SOS_PATTERNS):
+                        data_list.append(data)
+                else:
+                    data_list.append(data)
 
     return data_list
     
@@ -190,50 +234,6 @@ def plot_token_histogram(new_data_list):
 def sanitize_attachment_path(attachment_path):
     """Sanitize attachment paths by removing leading characters."""
     return attachment_path.lstrip("- ")
-
-# def generate_attachment_summaries(data_list):
-#     """Process list of data dictionaries and generate summaries."""
-#     error_messages = [
-#         "PDF processing error:", "DOCX processing error:",
-#         "Spreadsheet processing error:", "Text processing error:",
-#         "Image processing error:"
-#     ]
-
-#     for data in tqdm(data_list, desc="Processing data list"):
-#         title = data.get('title', 'Untitled')
-#         attachment_paths = data.get('attachments', [])
-        
-#         sanitized_paths = [p.lstrip("- ") for p in attachment_paths]
-#         for path in sanitized_paths:
-#             if os.path.exists(path):
-#                 base_path = os.path.splitext(path)[0]
-#                 summary_path = f"{base_path}_summary.txt"
-
-#                 # Check if summary file exists
-#                 if os.path.exists(summary_path):
-#                     with open(summary_path, "r", encoding="utf-8") as f:
-#                         content = f.read()
-
-#                     # Extract summary text
-#                     summary_start = content.find("Summary:\n")
-#                     if summary_start != -1:
-#                         existing_summary = content[summary_start + len("Summary:\n"):].strip()
-
-#                         # If existing summary contains an error message, redo summarization
-#                         if any(existing_summary.startswith(err) for err in error_messages):
-#                             print(f"Retrying summarization for {path} due to error...")
-#                             summaries = summarize_attachment(path, title)
-#                         else:
-#                             summaries = existing_summary
-#                     else:
-#                         summaries = summarize_attachment(path, title)
-#                 else:
-#                     summaries = summarize_attachment(path, title)
-#             else:
-#                 summaries = "File not found"
-#             #when I wrote it my intention was to pass the dict of all paths and summaries but storing them inmemory lead to kernel crashes...hence the workaround
-#             save_summaries({path:summaries}, title)
-
 
 async def generate_attachment_summaries(data_list, batch_size=5):
     """Process list of data dictionaries and generate summaries."""
@@ -576,19 +576,32 @@ def enrich_structured_data_with_summaries(data_list):
     return data_list
 
 def get_parent_chunks(data_list, parent_chunk_size):
+    # Enrich your data as before
     data_list = enrich_structured_data_with_summaries(data_list)
     chunked_data_list = []
+    
+    # Instantiate the custom splitter for parent chunks.
+    # Here, we use an overlap equivalent to 20% of the parent_chunk_size.
+    parent_splitter = CustomTablePreservingTextSplitter(
+        chunk_size=parent_chunk_size,
+        chunk_overlap=int(parent_chunk_size * 0.1),
+        separators=["\n\n", "\n", " "]
+    )
     
     for data in data_list:
         page_content = data.get("page_content", "")
         token_count = data.get("token_count", 0)
+        title = data.get("title","")
+        title_lower = title.lower()
+        if any(pattern in title_lower for pattern in SOS_PATTERNS):
+            search_priority = "SOS"
+        else:
+            search_priority = "normal"
 
         if token_count > parent_chunk_size:
-            chunks = chunk_content(page_content, max_tokens=parent_chunk_size, overlap_percent=10)
-            
+            # Use the custom splitter to split the content.
+            chunks = parent_splitter.split_text(page_content)
             for i, chunk in enumerate(chunks):
-                # Remember never to do this : child_chunked_data["title"] = data.get("title","")
-                # child_chunked_data["source"] = data.get("source","")..dictionaries are mutable!!!
                 chunked_data = {
                     "title": data.get("title", ""),
                     "source": data.get("source", ""),
@@ -596,42 +609,148 @@ def get_parent_chunks(data_list, parent_chunk_size):
                     "page_content": chunk,
                     "token_count": tiktoken_len(chunk),
                     "attachments": data.get("attachments", []),
-                    "attachment_summaries": data.get("attachment_summaries", {})
+                    "attachment_summaries": data.get("attachment_summaries", {}),
+                    "search_priority": search_priority
                 }
                 chunked_data_list.append(chunked_data)
-
         else:
-            chunked_data_list.append(data)  
+            chunked_data_list.append(data)
             
     return chunked_data_list
 
-def get_child_chunks(chunked_data_list, child_chunk_size):
+async def get_child_chunks(chunked_data_list, child_chunk_size, original_data_list=None,batch_size=7):
     chunked_child_data_list = []
+    
+    # Instantiate the custom splitter for child chunks.
+    child_splitter = CustomTablePreservingTextSplitter(
+        chunk_size=child_chunk_size,
+        chunk_overlap=int(child_chunk_size * 0.2),
+        separators=["\n\n", "\n", " "]
+    )
     
     for data in chunked_data_list:
         page_content = data.get("page_content", "")
         token_count = data.get("token_count", 0)
         
         if token_count > child_chunk_size:
-            chunks = chunk_content(page_content, max_tokens=child_chunk_size, overlap_percent=10)
-            
+            chunks = child_splitter.split_text(page_content)
             for i, chunk in enumerate(chunks):
-                # Create a new dictionary for each child chunk
                 child_chunked_data = {
                     "title": data.get("title", ""),
                     "source": data.get("source", ""),
                     "id": f"{data.get('id', '')}-c{i+1}",
-                    "parent_id": str(data.get("id", "")),
+                    "parent_id": str(data.get("id", data.get('id', ''))),
                     "page_content": f"### Title: {data.get('title', '')}\n{chunk}",
                     "token_count": tiktoken_len(chunk),
-                    "attachments": data.get("attachments", [])
+                    "attachments": data.get("attachments", []),
+                    "search_priority": data.get("search_priority","")
                 }
                 chunked_child_data_list.append(child_chunked_data)
-
         else:
-            chunked_child_data_list.append(data)  # Append original data if no chunking is needed
+            chunked_child_data_list.append(data)
+
+    if AUGMENTED_CHUNKING and original_data_list:
+        # Create mappings for efficient lookups
+        source_docs_map = {doc.get("id", ""): doc for doc in original_data_list}
+        parent_chunks_map = {data.get("id", ""): data for data in chunked_data_list}
+        
+        # Create batches for processing
+        batches = []
+        for i in range(0, len(chunked_child_data_list), batch_size):
+            batches.append(chunked_child_data_list[i:i+batch_size])
+        
+        # Process each batch
+        for batch in tqdm(batches, desc="Augmenting chunks in batches"):
+            augmentation_tasks = []
+            
+            for chunk in batch:
+                parent_id = chunk.get("parent_id", "")
+                source_id = parent_id.split("-")[0] if "-" in parent_id else parent_id
+                
+                source_doc = source_docs_map.get(source_id, {})
+                parent_doc = parent_chunks_map.get(parent_id, {})
+                
+                source_content = source_doc.get("page_content", "")
+                
+                # Determine which context to use
+                if len(source_content) <= 10000:
+                    context_doc = source_doc
+                else:
+                    context_doc = parent_doc
+                
+                # Add task for augmentation
+                augmentation_tasks.append(augment_chunk_using_llm(chunk, context_doc))
+            
+            try:
+                # Run all augmentation tasks for this batch concurrently
+                results = await asyncio.gather(*augmentation_tasks, return_exceptions=True)
+                
+                # Process results and update chunks
+                for chunk, result in zip(batch, results):
+                    if result and not isinstance(result, Exception):
+                        chunk["page_content"] = result
+                    elif isinstance(result, Exception):
+                        print(f"Error augmenting chunk {chunk.get('id')}: {result}")
+                
+                # Add some delay between batches to avoid API rate limits
+                if batch != batches[-1]:  # Don't sleep after the last batch
+                    await asyncio.sleep(10)
+                    
+            except Exception as e:
+                print(f"Error processing batch: {e}")
 
     return chunked_child_data_list
+
+async def augment_chunk_using_llm(chunk, context_doc):
+    """
+    Use LLM to augment a chunk by elaborating its content based on the provided context.
+    
+    Args:
+        chunk: The chunk to be augmented
+        context_doc: The source or parent document to provide context
+    
+    Returns:
+        Augmented content for the chunk
+    """
+    try:
+        chunk_content = chunk.get("page_content", "")
+        context_title = context_doc.get("title", "")
+        context_content = context_doc.get("page_content", "")
+        
+        # Prepare prompt for the LLM
+        prompt = f"""
+        I have a section from a document titled "{context_title}". 
+        
+        Here is the section:
+        ```
+        {chunk_content}
+        ```
+        
+        Based on the full context below, please:
+        1. Elaborate on this section to make its meaning clearer
+        2. Explain what specific questions this section answers in relation to the full context
+        3. Preserve all technical terms, code blocks, passwords, credentials,and links exactly as they appear
+        4. Do not add information that isn't supported by the context
+        
+        Full context:
+        ```
+        {context_content}
+        ```
+        
+        Your elaborated section:
+        """
+        
+        # Call LLM with the prompt
+        chain = gpt_4o | StrOutputParser()
+        response = await chain.ainvoke(prompt)
+        
+        if response:
+            return f"### Title: {context_title}\n{response}"
+        return chunk_content  # Return original if augmentation fails
+    
+    except Exception as e:
+        print(f"Error augmenting chunk: {e}")
+        return chunk.get("page_content", "")  # Return original content on error
 
 def index_parent_chunks(parent_chunks, db_path="parent_chunks.db"):
     """Inserts parent chunks into an SQLite database."""
@@ -647,15 +766,17 @@ def index_parent_chunks(parent_chunks, db_path="parent_chunks.db"):
             page_content TEXT,
             token_count INTEGER,
             attachments TEXT,
-            attachment_summaries TEXT
+            attachment_summaries TEXT,
+            search_priority TEXT
+          
         )
     ''')
 
     for chunk in parent_chunks:
         cursor.execute('''
             INSERT OR REPLACE INTO parent_chunks 
-            (id, title, source, page_content, token_count, attachments, attachment_summaries)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, title, source, page_content, token_count, attachments, attachment_summaries, search_priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             chunk.get("id", ""),
             chunk.get("title", ""),
@@ -663,7 +784,8 @@ def index_parent_chunks(parent_chunks, db_path="parent_chunks.db"):
             chunk.get("page_content", ""),
             chunk.get("token_count", 0),
             str(chunk.get("attachments", [])),  # Convert list to string for storage
-            str(chunk.get("attachment_summaries", {}))  # Convert dict to string for storage
+            str(chunk.get("attachment_summaries", {})),  # Convert dict to string for storage
+            str(chunk.get("search_priority",""))
         ))
 
     conn.commit()
@@ -687,11 +809,12 @@ def retrieve_parent_chunk(chunk_id, db_path="parent_chunks.db"):
             "page_content": row[3],
             "token_count": row[4],
             "attachments": eval(row[5]),  # Convert string back to list
-            "attachment_summaries": eval(row[6])  # Convert string back to dict
+            "attachment_summaries": eval(row[6]),  # Convert string back to dict
+            "search_priority": row[7]
         }
     return None
 
-def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model, output_file_path="./documents_with_embeddings.csv"):
+def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model,max_workers=2, output_file_path="./documents_with_embeddings.csv"):
     
     def compute_embedding(text):
         return embedding_model.embed_query(text)
@@ -700,7 +823,7 @@ def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model, outpu
         df = pd.read_csv(output_file_path)
         existing_ids = set(df["id"].tolist())
     else:
-        df = pd.DataFrame(columns=["id", "parent_id", "title", "source", "attachments", "page_content", "embeddings"])
+        df = pd.DataFrame(columns=["id", "parent_id", "title", "source", "attachments", "page_content", "embeddings", "search_priority"])
         existing_ids = set()
 
     new_data = [data for data in chunked_data_list if data.get("id", "") not in existing_ids]
@@ -712,12 +835,12 @@ def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model, outpu
     file_exists = os.path.exists(output_file_path)
     
     with open(output_file_path, mode="a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["id", "parent_id", "title", "source", "attachments", "page_content", "embeddings"])
+        writer = csv.DictWriter(file, fieldnames=["id", "parent_id", "title", "source", "attachments", "page_content", "embeddings", "search_priority"])
 
         if not file_exists:
             writer.writeheader()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_data = {executor.submit(compute_embedding, data["page_content"]): data for data in new_data}
 
             for future in tqdm(concurrent.futures.as_completed(future_to_data), total=len(future_to_data), desc="Computing embeddings"):
@@ -731,12 +854,14 @@ def generate_embeddings_and_save_in_df(chunked_data_list, embedding_model, outpu
                         "source": data.get("source", ""),
                         "attachments": data.get("attachments", []),
                         "page_content": data.get("page_content", ""),
+                        "search_priority":data.get("search_priority",""),
                         "embeddings": embedding
                     }
                     writer.writerow(row)
                 except Exception as exc:
                     print(f"Error processing document {data.get('id', '')}: {exc}")
     print(f"Embeddings have been computed and saved to '{output_file_path}'.")
+
 
 def index_child_embeddings(csv_path="./child_chunks_400_with_embeddings.csv",
                            batch_size=100,
@@ -750,7 +875,7 @@ def index_child_embeddings(csv_path="./child_chunks_400_with_embeddings.csv",
             return self.model.embed_documents(input)
 
     def create_chroma_client():
-        return chromadb.PersistentClient("./confluence_db_v2")
+        return chromadb.PersistentClient(VECTORDB_PATH)
 
     def process_batch(collection, batch_df):
         # Convert embeddings from string to list if necessary
@@ -765,13 +890,13 @@ def index_child_embeddings(csv_path="./child_chunks_400_with_embeddings.csv",
         collection.upsert(
             ids=batch_df["id"].astype(str).tolist(),
             documents=batch_df["page_content"].tolist(),
-            metadatas=batch_df[["title", "parent_id", "source", "attachments"]].to_dict("records"),
+            metadatas=batch_df[["title", "parent_id", "source", "attachments","search_priority"]].to_dict("records"),
             embeddings=batch_df["embeddings"].tolist(),
         )
 
     client = create_chroma_client()
     
-    embedding_model = MyEmbeddingFunction(model_name="BAAI/bge-base-en-v1.5", device="cpu")
+    embedding_model = MyEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME, device="cpu")
     
     collection = client.get_or_create_collection(
         name=collection_name,
@@ -790,7 +915,7 @@ def index_child_embeddings(csv_path="./child_chunks_400_with_embeddings.csv",
     print(f"Successfully upserted all documents into Chroma DB")
 
     # Ensure consistent embedding function in Chroma
-    vectordb = Chroma(persist_directory="./confluence_db_v2",
+    vectordb = Chroma(persist_directory=VECTORDB_PATH,
                       collection_name=collection_name,
                       embedding_function=embedding_model)
     
@@ -808,18 +933,34 @@ def clean_and_save_df(df, column="id", output_file="cleaned_data.csv"):
     print(f"\nCleaned DataFrame saved to '{output_file}'.")
     return df_cleaned
 
+def convert_dict_to_doc(chunks):
+    from langchain.schema import Document
+    docs = []
+    for chunk in chunks:
+        doc = Document(
+            page_content=chunk["page_content"],
+            metadata={
+                "title": chunk["title"],
+                "source": chunk["source"],
+                "id": chunk["id"],
+                "attachments": chunk["attachments"],
+            }
+        )
+        docs.append(doc)
+    return docs
+
+
 async def main():
-    folder_path = './md_output'  # Change this path as needed
-    data_list = extract_structured_data_from_md_files(folder_path)
+    data_list = extract_structured_data_from_md_files(MD_FOLDER_PATH)
     # plot_token_histogram(data_list)
     # await generate_attachment_summaries(data_list)
-    parent_chunks = get_parent_chunks(data_list,parent_chunk_size=1200)
-    child_chunks = get_child_chunks(parent_chunks,child_chunk_size=400)
-    index_parent_chunks(parent_chunks,db_path="parent_chunks.db")
-    generate_embeddings_and_save_in_df(child_chunks,embedding_model=embedding_model,output_file_path="./child_chunks_400_with_embeddings.csv")
-    clean_and_save_df(pd.read_csv("./child_chunks_400_with_embeddings.csv"),output_file="cleaned_child_chunks_400_with_embeddings.csv")
-    index_child_embeddings(csv_path="./cleaned_child_chunks_400_with_embeddings.csv",batch_size=100,collection_name="confluence_child_retriever_400")
-    
+    parent_chunks = get_parent_chunks(data_list,parent_chunk_size=PARENT_CHUNK_SIZE)
+    child_chunks = await get_child_chunks(parent_chunks,child_chunk_size=CHILD_CHUNK_SIZE,original_data_list=data_list,batch_size=30)
+    index_parent_chunks(parent_chunks,PARENT_CHUNKS_DB_PATH)
+    generate_embeddings_and_save_in_df(child_chunks,embedding_model,max_workers=2,output_file_path=CHILD_CHUNKS_CSV_FILE_PATH)
+    clean_and_save_df(pd.read_csv(CHILD_CHUNKS_CSV_FILE_PATH),output_file=CLEANED_CHILD_CHUNKS_CSV_FILE_PATH)
+    index_child_embeddings(CLEANED_CHILD_CHUNKS_CSV_FILE_PATH,collection_name=COLLECTION_NAME,batch_size=100)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
