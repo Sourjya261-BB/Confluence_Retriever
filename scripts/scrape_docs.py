@@ -4,6 +4,8 @@ import markdownify
 from urllib.parse import urljoin
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+import concurrent.futures
+import time
 
 load_dotenv(override=True) 
 
@@ -22,6 +24,8 @@ HEADERS = {
 
 # Output directory
 OUTPUT_DIR = './md_output'
+# Number of worker threads for parallel processing
+MAX_WORKERS = 10
 
 def count_processed_pages():
     """ Count how many pages have already been processed """
@@ -42,23 +46,6 @@ def get_pages(space_key, start=0, limit=25):
     response.raise_for_status()
     return response.json()
 
-# def get_pages(space_key, start=0, limit=25):
-#     url = f'{CONFLUENCE_URL}/rest/api/content'
-#     params = {
-#         'spaceKey': space_key,
-#         'start': start,
-#         'limit': limit,
-#         'expand': 'body.storage,version',
-#         'orderBy': 'version.lastUpdated DESC'  # -> addressed the orderig issue as of friday 28th feb
-#     }
-#     response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-
-#     if response.status_code == 400:
-#         print(f"Bad Request: {response.text}")  # Print API response for debugging
-
-#     response.raise_for_status()
-#     return response.json()
-
 def get_attachments(page_id):
     url = f'{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment'
     response = requests.get(url, headers=HEADERS, auth=auth)
@@ -66,7 +53,6 @@ def get_attachments(page_id):
     return response.json()
 
 def sanitize_filename(filename):
-    #return ''.join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in filename)
     filename = filename.replace('/', '_')
     return filename
 
@@ -77,14 +63,24 @@ def download_attachments(page_id, page_title):
     if not os.path.exists(page_dir):
         os.makedirs(page_dir, exist_ok=True)
 
-    attachments = get_attachments(page_id)
+    try:
+        attachments = get_attachments(page_id)
+    except requests.exceptions.HTTPError as e:
+        print(f"Error getting attachments for page {page_id}: {str(e)}")
+        return []
+        
     local_paths = []
     
     for attachment in attachments.get('results', []):
         attachment_url = CONFLUENCE_URL + attachment['_links']['download']
         attachment_name = attachment['title']
+
+        if attachment_name.lower().endswith(('.mp3', '.mp4')): #there are mp3 files also damnn
+            print(f"Skipping attachment: {attachment_name} (MP3/MP4 file)")
+            continue 
+
         attachment_path = os.path.join(page_dir, attachment_name)
-        print(f"attachement_url:{attachment_url}")
+        print(f"Downloading attachment: {attachment_url}")
 
         try:
             response = requests.get(attachment_url, auth=(USERNAME, API_TOKEN))
@@ -98,8 +94,14 @@ def download_attachments(page_id, page_title):
         except requests.exceptions.HTTPError as e:
             if response.status_code == 404:
                 print(f"Attachment not found: {attachment_name} (404)")
+            elif response.status_code == 400:
+                print(f"Bad request for attachment: {attachment_name} (400) - Skipping")
+                if "UNKNOWN_MEDIA_ID" in str(e):
+                    print(f"  Attachment has UNKNOWN_MEDIA_ID issue")
             else:
-                raise e
+                print(f"HTTP error downloading {attachment_name}: {str(e)}")
+        except Exception as e:
+            print(f"Error downloading {attachment_name}: {str(e)}")
 
     return local_paths
 
@@ -116,7 +118,7 @@ def save_page_as_markdown(page):
     
     content = page['body']['storage']['value']
     source_url = page['_links']['self']
-    print(f"source_url:{source_url}")
+    print(f"Processing page: {title} (ID: {page_id})")
     
     # Convert HTML content to Markdown
     markdown_content = markdownify.markdownify(content, heading_style="ATX")
@@ -130,171 +132,108 @@ def save_page_as_markdown(page):
     with open(os.path.join(OUTPUT_DIR, f'{sanitize_filename(title)}.md'), 'w', encoding='utf-8') as md_file:
         md_file.write(f"# {title}\n{attachments_section}{source_section}\n### Page_content:\n{markdown_content}")
 
-def main():
-    start = 0
-    limit = 50
-    page_count = 0
-    # max_pages=1000
-    print(f"Processed Pages: {count_processed_pages()}")
-    while True:
-    # while page_count < max_pages:
-        pages_data = get_pages(SPACE_KEY, start=start, limit=limit)
-        pages = pages_data['results']
-        for page in pages:
-            save_page_as_markdown(page)
-            page_count=page_count+1
+def process_page(page):
+    """Process a single page - for parallel execution"""
+    try:
+        title = page['title']
+        page_id = page['id']
+        markdown_filename = f"{sanitize_filename(title)}.md"
+        markdown_path = os.path.join(OUTPUT_DIR, markdown_filename)
+
+        # Skip if the file already exists
+        if os.path.exists(markdown_path):
+            print(f"Skipping {title}, already processed.")
+            return title, "skipped"
         
-        if 'next' not in pages_data['_links']:
+        content = page['body']['storage']['value']
+        source_url = page['_links']['self']
+        print(f"Processing page: {title} (ID: {page_id})")
+        
+        # Convert HTML content to Markdown
+        markdown_content = markdownify.markdownify(content, heading_style="ATX")
+        
+        # Download attachments and prepare their paths and the source URL section
+        attachments = download_attachments(page_id, title)
+        attachments_section = f"\n### Attachments:\n" + "\n".join([f"- {path}" for path in attachments]) + "\n"
+        source_section = f"\n### Source:\n{source_url}\n"
+        
+        # Save to Markdown file
+        with open(markdown_path, 'w', encoding='utf-8') as md_file:
+            md_file.write(f"# {title}\n{attachments_section}{source_section}\n### Page_content:\n{markdown_content}")
+        
+        return title, True
+    except Exception as e:
+        return page.get('title', 'Unknown page'), f"Error: {str(e)}"
+
+def main():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+    start = 0
+    limit = 150
+    total_pages_processed = 0
+    failed_pages = []
+    
+    print(f"Previously Processed Pages: {count_processed_pages()}")
+    start_time = time.time()
+    
+    while True:
+        try:
+            pages_data = get_pages(SPACE_KEY, start=start, limit=limit)
+            pages = pages_data['results']
+            
+            if not pages:
+                print("No more pages to process.")
+                break
+                
+            print(f"Processing batch of {len(pages)} pages starting from index {start}")
+                
+            # Process pages in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Submit all page processing tasks to the executor
+                future_to_page = {executor.submit(process_page, page): page for page in pages}
+                
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(future_to_page):
+                    page = future_to_page[future]
+                    try:
+                        title, result = future.result()
+                        if result is True:
+                            print(f"✓ Successfully processed: {title}")
+                            total_pages_processed += 1
+                        elif result == "skipped":
+                            print(f"↷ Skipped already processed: {title}")
+                        else:
+                            print(f"✗ Failed to process: {title} - {result}")
+                            failed_pages.append((title, result))
+                    except Exception as exc:
+                        page_title = page.get('title', 'Unknown')
+                        print(f"✗ Error processing page {page_title}: {exc}")
+                        failed_pages.append((page_title, str(exc)))
+            
+            if 'next' not in pages_data['_links']:
+                print("No more pages available.")
+                break
+            start += limit
+            
+        except Exception as e:
+            print(f"Error in main processing loop: {str(e)}")
             break
-        start += limit
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    print("\n===== SUMMARY =====")
+    print(f"Completed processing {total_pages_processed} pages in {elapsed_time:.2f} seconds")
+    if total_pages_processed > 0:
+        print(f"Average time per page: {elapsed_time/total_pages_processed:.2f} seconds")
+    
+    if failed_pages:
+        print(f"\nFailed to process {len(failed_pages)} pages:")
+        for title, error in failed_pages[:20]:  # Show only first 20 failures to avoid overwhelming output
+            print(f"- {title}: {error}")
+        if len(failed_pages) > 20:
+            print(f"  ...and {len(failed_pages) - 20} more failures")
 
 if __name__ == '__main__':
     main()
-
-
-
-
-# import os
-# import requests
-# import markdownify
-# from tqdm import tqdm
-# from requests.auth import HTTPBasicAuth
-# from dotenv import load_dotenv
-
-# load_dotenv(override=True)
-
-# # Confluence API endpoint and credentials
-# CONFLUENCE_URL = "https://bigbasket.atlassian.net/wiki"
-# SPACE_KEY = 'BIG'
-# USERNAME = os.environ.get("USERNAME")
-# API_TOKEN = os.environ.get("API_TOKEN")
-# auth = HTTPBasicAuth(USERNAME, API_TOKEN)
-
-# # Headers for authentication
-# HEADERS = {'Content-Type': 'application/json'}
-
-# # Output directory
-# OUTPUT_DIR = './md_output'
-# os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
-# def get_attachments(page_id):
-#     url = f'{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment'
-#     response = requests.get(url, headers=HEADERS, auth=auth)
-#     response.raise_for_status()
-#     return response.json()
-
-# def download_attachments(page_id, page_title):
-#     page_title = sanitize_filename(page_title)
-#     page_dir = os.path.join(OUTPUT_DIR, page_title)
-
-#     if not os.path.exists(page_dir):
-#         os.makedirs(page_dir, exist_ok=True)
-
-#     attachments = get_attachments(page_id)
-#     local_paths = []
-    
-#     for attachment in attachments.get('results', []):
-#         attachment_url = CONFLUENCE_URL + attachment['_links']['download']
-#         attachment_name = attachment['title']
-#         attachment_path = os.path.join(page_dir, attachment_name)
-#         print(f"attachement_url:{attachment_url}")
-
-#         try:
-#             response = requests.get(attachment_url, auth=(USERNAME, API_TOKEN))
-#             response.raise_for_status()
-
-#             with open(attachment_path, 'wb') as file:
-#                 file.write(response.content)
-#                 print(f"Attachment found: {attachment_name}")
-
-#             local_paths.append(attachment_path)
-#         except requests.exceptions.HTTPError as e:
-#             if response.status_code == 404:
-#                 print(f"Attachment not found: {attachment_name} (404)")
-#             else:
-#                 raise e
-
-#     return local_paths
-
-# def get_all_page_ids(space_key):
-#     """ Fetch all page IDs and titles from Confluence. """
-#     page_ids = {}
-#     start = 0
-#     limit = 50
-
-#     while True:
-#         url = f'{CONFLUENCE_URL}/rest/api/content'
-#         params = {'spaceKey': space_key, 'start': start, 'limit': limit}
-#         response = requests.get(url, headers=HEADERS, params=params, auth=auth)
-#         response.raise_for_status()
-#         data = response.json()
-
-#         for page in data['results']:
-#             title = sanitize_filename(page['title'])
-#             page_ids[page['id']] = title  # Store page_id -> title mapping
-
-#         if 'next' not in data['_links']:
-#             break
-
-#         start += limit
-
-#     return page_ids
-
-# def count_processed_pages():
-#     """ Get a set of already processed page filenames. """
-#     return {f[:-3] for f in os.listdir(OUTPUT_DIR) if f.endswith('.md')}
-
-# def get_page_content(page_id):
-#     """ Fetch full page content from Confluence. """
-#     url = f'{CONFLUENCE_URL}/rest/api/content/{page_id}?expand=body.storage'
-#     response = requests.get(url, headers=HEADERS, auth=auth)
-#     response.raise_for_status()
-#     return response.json()
-
-# def sanitize_filename(filename):
-#     """ Replace special characters to create a safe filename. """
-#     return filename.replace('/', '_')
-
-# def save_page_as_markdown(page_id,page_title, page_content, source_url):
-
-#     print(f"source_url:{source_url}")
-    
-#     # Convert HTML content to Markdown
-#     markdown_content = markdownify.markdownify(page_content, heading_style="ATX")
-    
-#     # Download attachments and prepare their paths and the source URL section
-#     attachments = download_attachments(page_id, page_title)
-#     attachments_section = f"\n### Attachments:\n" + "\n".join([f"- {path}" for path in attachments]) + "\n"
-#     source_section = f"\n### Source:\n{source_url}\n"
-    
-#     # Save to Markdown file
-#     with open(os.path.join(OUTPUT_DIR, f'{sanitize_filename(page_title)}.md'), 'w', encoding='utf-8') as md_file:
-#         md_file.write(f"# {page_title}\n{attachments_section}{source_section}\n### Page_content:\n{markdown_content}")
-
-
-# def main():
-#     # Step 1: Get all pages and already processed pages
-#     all_pages = get_all_page_ids(SPACE_KEY)
-#     processed_pages = count_processed_pages()
-
-#     # Step 2: Identify pages to fetch
-#     unprocessed_pages = {id: title for id, title in all_pages.items() if title not in processed_pages}
-
-#     print(f"Total Pages: {len(all_pages)}, Already Processed: {len(processed_pages)}, Remaining: {len(unprocessed_pages)}")
-
-#     # Step 3: Process only unprocessed pages with a progress bar
-#     progress_bar = tqdm(total=len(unprocessed_pages), desc="Processing Pages", unit="page")
-
-#     for page_id, title in unprocessed_pages.items():
-#         page_data = get_page_content(page_id)
-#         page_content = page_data['body']['storage']['value']
-#         source_url = page_data['_links']['self']
-#         save_page_as_markdown(page_id,title, page_content, source_url)
-#         progress_bar.update(1)
-
-#     progress_bar.close()
-#     print("Processing complete!")
-
-# if __name__ == '__main__':
-#     main()

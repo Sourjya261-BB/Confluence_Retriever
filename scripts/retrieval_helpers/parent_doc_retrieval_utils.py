@@ -441,5 +441,48 @@ class SimpleParentDocRetriever:
         if len(parent_docs) > 3:
             parent_docs = self.rerank_parent_docs(query, parent_docs)
         return parent_docs  
+    
+
+
+class ChildDocRetriever:
+    
+    def __init__(self,top_k):
+        self.top_k = top_k
+
+    def convert_doc_to_dict(self,doc):
+        """Convert a Document object to a dictionary."""
+        return {
+            "id": doc.metadata.get("id", "unknown"),
+            "title": doc.metadata.get("title", ""),
+            "source": doc.metadata.get("source", ""),
+            "page_content": doc.page_content,
+            "token_count": len(doc.page_content),
+            "attachments": doc.metadata.get("attachments", []),
+            "attachment_summaries": doc.metadata.get("attachment_summaries", []),
+            "search_priority": doc.metadata.get("search_priority","normal")
+        }
+
+    def rerank_child_docs(self,query, child_docs):
+        try:
+            from sentence_transformers import CrossEncoder
+            reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        except Exception as e:
+            print(f"Reranker error: {e}. Returning original parent docs")
+            return child_docs
+
+        pairs = [[query, doc.page_content] for doc in child_docs]
+        scores = reranker.predict(pairs)
+        ranked_results = sorted(zip(child_docs, scores), key=lambda x: x[1], reverse=True)
+        return [doc for doc, score in ranked_results[:self.top_k]]
+    
+    def retrieve_child_docs(self,query,child_chunks_retriever):
+        child_docs = child_chunks_retriever.invoke(query)
+        if len(child_docs) > 3:
+            child_docs = self.rerank_child_docs(query, child_docs)
+        result = []
+        for child_doc in child_docs:
+            result.append(self.convert_doc_to_dict(child_doc))
+        return result
+
         
           

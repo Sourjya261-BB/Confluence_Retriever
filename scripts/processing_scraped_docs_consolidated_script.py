@@ -8,6 +8,8 @@ import tiktoken
 import sqlite3
 import asyncio
 import base64
+import string
+import random
 import chromadb
 import chardet
 import pandas as pd
@@ -22,15 +24,15 @@ from docx import Document
 from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from chromadb.utils.embedding_functions import EmbeddingFunction
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from commons import embedding_model,gpt_35, gpt_4o
-
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import PARENT_CHUNK_SIZE, CHILD_CHUNK_SIZE, MD_FOLDER_PATH, PARENT_CHUNKS_DB_PATH, CHILD_CHUNKS_CSV_FILE_PATH, CLEANED_CHILD_CHUNKS_CSV_FILE_PATH, COLLECTION_NAME, VECTORDB_PATH, EMBEDDING_MODEL_NAME,SOS
+from config import PARENT_CHUNK_SIZE, CHILD_CHUNK_SIZE, MD_FOLDER_PATH, PARENT_CHUNKS_DB_PATH, CHILD_CHUNKS_CSV_FILE_PATH, CLEANED_CHILD_CHUNKS_CSV_FILE_PATH, COLLECTION_NAME, VECTORDB_PATH, EMBEDDING_MODEL_NAME,SOS,AUGMENTED_CHUNKING, RETRIEVAL_MODE,SOS_PATTERNS
 
 
 
@@ -48,6 +50,10 @@ def tiktoken_len(text):
 # Hash function to generate an 8-digit ID from the source URL
 def generate_id(source_url):
     return int(hashlib.sha256(source_url.encode('utf-8')).hexdigest(), 16) % 10**8
+
+def generate_random_string(length=10):
+    characters = string.ascii_letters + string.digits  # Letters (a-z, A-Z) and digits (0-9)
+    return ''.join(random.choices(characters, k=length))
 
 # def chunk_content(text, max_tokens=10000, overlap_percent=10):
 #     """
@@ -93,8 +99,6 @@ def generate_id(source_url):
 #         start += step_size
     
 #     return chunks
-
-
 class CustomTablePreservingTextSplitter(RecursiveCharacterTextSplitter):
     def _is_markdown_table(self, text: str) -> bool:
         """Check if the given text is a Markdown table."""
@@ -176,7 +180,11 @@ def extract_structured_data_from_md_files(folder_path):
                 source = content[source_start:source_end].strip()
                 
                 # Generate ID from the source URL
-                id = generate_id(source)
+                if source=="":
+                    print(f"Could not find source for title {title}")
+                    id = generate_id(generate_random_string(10))
+                else:
+                    id = generate_id(title)
                 
                 # Extract Page Content
                 page_content_start = content.find("### Page_content:") + len("### Page_content:")
@@ -198,8 +206,7 @@ def extract_structured_data_from_md_files(folder_path):
                 if SOS:
                     title = data.get("title","")
                     title_lower = title.lower()
-                    patterns = ["sop", "resilience", "resiliency", "rps", "jdvar", "solr", "grafana"]
-                    if any(pattern in title_lower for pattern in patterns):
+                    if any(pattern in title_lower for pattern in SOS_PATTERNS):
                         data_list.append(data)
                 else:
                     data_list.append(data)
@@ -586,8 +593,7 @@ def get_parent_chunks(data_list, parent_chunk_size):
         token_count = data.get("token_count", 0)
         title = data.get("title","")
         title_lower = title.lower()
-        patterns = ["sop", "resilience", "resiliency", "rps", "jdvar", "solr", "grafana"]
-        if any(pattern in title_lower for pattern in patterns):
+        if any(pattern in title_lower for pattern in SOS_PATTERNS):
             search_priority = "SOS"
         else:
             search_priority = "normal"
@@ -612,7 +618,7 @@ def get_parent_chunks(data_list, parent_chunk_size):
             
     return chunked_data_list
 
-def get_child_chunks(chunked_data_list, child_chunk_size):
+async def get_child_chunks(chunked_data_list, child_chunk_size, original_data_list=None,batch_size=7):
     chunked_child_data_list = []
     
     # Instantiate the custom splitter for child chunks.
@@ -633,17 +639,118 @@ def get_child_chunks(chunked_data_list, child_chunk_size):
                     "title": data.get("title", ""),
                     "source": data.get("source", ""),
                     "id": f"{data.get('id', '')}-c{i+1}",
-                    "parent_id": str(data.get("id", "")),
+                    "parent_id": str(data.get("id", data.get('id', ''))),
                     "page_content": f"### Title: {data.get('title', '')}\n{chunk}",
                     "token_count": tiktoken_len(chunk),
                     "attachments": data.get("attachments", []),
-                    "search_priority": data.get("search_priority",[])
+                    "search_priority": data.get("search_priority","")
                 }
                 chunked_child_data_list.append(child_chunked_data)
         else:
             chunked_child_data_list.append(data)
+
+    if AUGMENTED_CHUNKING and original_data_list:
+        # Create mappings for efficient lookups
+        source_docs_map = {doc.get("id", ""): doc for doc in original_data_list}
+        parent_chunks_map = {data.get("id", ""): data for data in chunked_data_list}
+        
+        # Create batches for processing
+        batches = []
+        for i in range(0, len(chunked_child_data_list), batch_size):
+            batches.append(chunked_child_data_list[i:i+batch_size])
+        
+        # Process each batch
+        for batch in tqdm(batches, desc="Augmenting chunks in batches"):
+            augmentation_tasks = []
+            
+            for chunk in batch:
+                parent_id = chunk.get("parent_id", "")
+                source_id = parent_id.split("-")[0] if "-" in parent_id else parent_id
+                
+                source_doc = source_docs_map.get(source_id, {})
+                parent_doc = parent_chunks_map.get(parent_id, {})
+                
+                source_content = source_doc.get("page_content", "")
+                
+                # Determine which context to use
+                if len(source_content) <= 10000:
+                    context_doc = source_doc
+                else:
+                    context_doc = parent_doc
+                
+                # Add task for augmentation
+                augmentation_tasks.append(augment_chunk_using_llm(chunk, context_doc))
+            
+            try:
+                # Run all augmentation tasks for this batch concurrently
+                results = await asyncio.gather(*augmentation_tasks, return_exceptions=True)
+                
+                # Process results and update chunks
+                for chunk, result in zip(batch, results):
+                    if result and not isinstance(result, Exception):
+                        chunk["page_content"] = result
+                    elif isinstance(result, Exception):
+                        print(f"Error augmenting chunk {chunk.get('id')}: {result}")
+                
+                # Add some delay between batches to avoid API rate limits
+                if batch != batches[-1]:  # Don't sleep after the last batch
+                    await asyncio.sleep(10)
+                    
+            except Exception as e:
+                print(f"Error processing batch: {e}")
+
     return chunked_child_data_list
 
+async def augment_chunk_using_llm(chunk, context_doc):
+    """
+    Use LLM to augment a chunk by elaborating its content based on the provided context.
+    
+    Args:
+        chunk: The chunk to be augmented
+        context_doc: The source or parent document to provide context
+    
+    Returns:
+        Augmented content for the chunk
+    """
+    try:
+        chunk_content = chunk.get("page_content", "")
+        context_title = context_doc.get("title", "")
+        context_content = context_doc.get("page_content", "")
+        
+        # Prepare prompt for the LLM
+        prompt = f"""
+        I have a section from a document titled "{context_title}". 
+        
+        Here is the section:
+        ```
+        {chunk_content}
+        ```
+        
+        Based on the full context below, please:
+        1. Elaborate on this section to make its meaning clearer
+        2. Explain what specific questions this section answers in relation to the full context
+        3. Preserve all technical terms, code blocks, passwords, credentials,and links exactly as they appear
+        4. Do not add information that isn't supported by the context
+        
+        Full context:
+        ```
+        {context_content}
+        ```
+        
+        Your elaborated section:
+        """
+        
+        # Call LLM with the prompt
+        chain = gpt_4o | StrOutputParser()
+        response = await chain.ainvoke(prompt)
+        
+        if response:
+            return f"### Title: {context_title}\n{response}"
+        return chunk_content  # Return original if augmentation fails
+    
+    except Exception as e:
+        print(f"Error augmenting chunk: {e}")
+        return chunk.get("page_content", "")  # Return original content on error
 
 def index_parent_chunks(parent_chunks, db_path="parent_chunks.db"):
     """Inserts parent chunks into an SQLite database."""
@@ -826,17 +933,34 @@ def clean_and_save_df(df, column="id", output_file="cleaned_data.csv"):
     print(f"\nCleaned DataFrame saved to '{output_file}'.")
     return df_cleaned
 
+def convert_dict_to_doc(chunks):
+    from langchain.schema import Document
+    docs = []
+    for chunk in chunks:
+        doc = Document(
+            page_content=chunk["page_content"],
+            metadata={
+                "title": chunk["title"],
+                "source": chunk["source"],
+                "id": chunk["id"],
+                "attachments": chunk["attachments"],
+            }
+        )
+        docs.append(doc)
+    return docs
+
+
 async def main():
     data_list = extract_structured_data_from_md_files(MD_FOLDER_PATH)
     # plot_token_histogram(data_list)
     # await generate_attachment_summaries(data_list)
     parent_chunks = get_parent_chunks(data_list,parent_chunk_size=PARENT_CHUNK_SIZE)
-    child_chunks = get_child_chunks(parent_chunks,child_chunk_size=CHILD_CHUNK_SIZE)
+    child_chunks = await get_child_chunks(parent_chunks,child_chunk_size=CHILD_CHUNK_SIZE,original_data_list=data_list,batch_size=30)
     index_parent_chunks(parent_chunks,PARENT_CHUNKS_DB_PATH)
     generate_embeddings_and_save_in_df(child_chunks,embedding_model,max_workers=2,output_file_path=CHILD_CHUNKS_CSV_FILE_PATH)
     clean_and_save_df(pd.read_csv(CHILD_CHUNKS_CSV_FILE_PATH),output_file=CLEANED_CHILD_CHUNKS_CSV_FILE_PATH)
     index_child_embeddings(CLEANED_CHILD_CHUNKS_CSV_FILE_PATH,collection_name=COLLECTION_NAME,batch_size=100)
-    
+
 
 if __name__ == "__main__":
     asyncio.run(main())

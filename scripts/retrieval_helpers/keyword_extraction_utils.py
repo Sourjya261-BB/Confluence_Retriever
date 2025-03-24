@@ -4,7 +4,6 @@ import sys
 import spacy
 from collections import Counter
 from langchain_core.output_parsers import JsonOutputParser
-from sklearn.feature_extraction.text import TfidfVectorizer
 from scripts.commons import gpt_35
 
 try:
@@ -199,7 +198,7 @@ def extract_keywords_from_query_using_llm(user_query, llm):
     Output: List(str)
     """
     prompt = f"""
-    Analyze the query and extract the relevant keywords that may be used for search optimization
+    Analyze the query and extract the relevant keywords that may be used for search optimization. Keep in mind if the user is searching for ways to drop_traffic for an api "SOP Resilience Usage" must be included in keywords
     User Query: "{user_query}"
     Output format:
     ```json

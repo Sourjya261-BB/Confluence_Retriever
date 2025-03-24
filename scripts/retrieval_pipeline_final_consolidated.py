@@ -20,13 +20,11 @@ from dotenv import load_dotenv
 
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import PARENT_CHUNKS_DB_PATH, TOP_K, KEYWORD_EXTRACTION_MODE
+from config import PARENT_CHUNKS_DB_PATH, TOP_K, KEYWORD_EXTRACTION_MODE, RETRIEVER_MECHANISM 
 from commons import gpt_35,gpt_4o,get_retriever
-from retrieval_helpers.parent_doc_retrieval_utils import SimpleParentDocRetriever,ComplexParentDocRetriever
+from retrieval_helpers.parent_doc_retrieval_utils import SimpleParentDocRetriever,ComplexParentDocRetriever,ChildDocRetriever
 from retrieval_helpers.common_utils import transform_source_links
 # Load spaCy model - you'll need to install it with: python -m spacy download en_core_web_sm
-nlp = spacy.load("en_core_web_sm")
-
 
 torch.classes.__path__ = []
 
@@ -46,42 +44,23 @@ child_retriever = get_retriever()
 class RobustJsonOutputParser(JsonOutputParser):
     def parse(self, text: str):
         try:
-            # First try the regular parser
             return super().parse(text)
-        except Exception as e:
-            # If that fails, try to extract JSON from markdown code blocks
+        
+        except Exception as original_error:
+
+            print(f"first round of parsing failed due to error:{original_error}")
             try:
-                # Look for JSON in code blocks
-                json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-                if json_match:
-                    json_str = json_match.group(1).strip()
-                    return json.loads(json_str)
+                first_brace = text.find('{')
+                last_brace = text.rfind('}')
                 
-                # If no code blocks, try to find JSON-like structures with curly braces
-                json_match = re.search(r'({[\s\S]*})', text)
-                if json_match:
-                    json_str = json_match.group(1).strip()
+                if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+                    json_str = text[first_brace:last_brace+1]
                     return json.loads(json_str)
-                    
-                # If all else fails, raise the original exception
-                raise e
-            except Exception:
-                # If our recovery attempts fail, raise the original exception
-                raise e
 
-# Then use it with your LLM using the pipe syntax
-robust_parser = RobustJsonOutputParser()
+            except Exception as secondary_error:
 
-def extract_json(text):
-    match = re.search(r'```json\s*({.*})\s*```', text, re.DOTALL)
-    if match:
-        try:
-            json_data = json.loads(match.group(1))
-            return json_data
-        except json.JSONDecodeError:
-            print("Error: Invalid JSON format.")
-            return None
-    return None
+                raise secondary_error
+            raise original_error
 
 def tiktoken_len(text):
     """Returns the number of tokens in a text using tiktoken."""
@@ -280,8 +259,16 @@ async def retrieve_docs(user_query,llm):
     # user_query = await generate_keyword_rich_query(user_query, llm)
     print("Keyword-rich query:", user_query)
     # docs = await retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
-    parent_retriever = ComplexParentDocRetriever(PARENT_CHUNKS_DB_PATH,TOP_K//2,KEYWORD_EXTRACTION_MODE)
-    docs = parent_retriever.retrieve_parent_docs(user_query,child_retriever)
+    if RETRIEVER_MECHANISM=="complex_parent":
+        parent_retriever = ComplexParentDocRetriever(PARENT_CHUNKS_DB_PATH,TOP_K//2,KEYWORD_EXTRACTION_MODE)
+        docs = parent_retriever.retrieve_parent_docs(user_query,child_retriever)
+    elif RETRIEVER_MECHANISM=="simple_parent":
+        parent_retriever = SimpleParentDocRetriever(PARENT_CHUNKS_DB_PATH,TOP_K//2,KEYWORD_EXTRACTION_MODE)
+        docs = parent_retriever.retrieve_parent_docs(user_query,child_retriever)
+    elif RETRIEVER_MECHANISM=="child":
+        child_docs_retriever = ChildDocRetriever(TOP_K)
+        docs = child_docs_retriever.retrieve_child_docs(user_query,child_retriever)
+
     print(docs)
     # docs = retrieve_parent_docs(user_query,retriever,PARENT_CHUNKS_DB_PATH)
     docs = transform_source_links(docs)
@@ -377,28 +364,26 @@ async def generate_response_for_retrieved_text(total_text_context,user_query,llm
 
     1. Answer the user query truthfully. If you do not know the answer, state that you do not know.
     2. Include the relevant source URL in the specified format in your answer. Mention these links/paths in the answer as well.
-    3. If the retrieved context contains code or tables, include them in the output and add explanatory text.
-    4. Always produce the source link in the answer and ask the user to refer to it for further information.
-    5. If the retrieved context is relevant then try to make the answer as detailed and well structured as possible (md format).
+    3. If the retrieved context contains code or tables, include them in the output and add explanatory text. You will be rewarded for providing code along with explanation in the response.
+    4. Always produce the source link in the answer and ask the user to refer to it for further information. The source links must always bear the title of the source. 
+    5. If the retrieved context is relevant then try to make the answer as detailed and well structured as possible (md format). Be extensive with the detail you will be rewarded for it. 
 
     Output Format:
 
     The output must be a JSON object in the following format:
     ```json
+    {{"output":
     {{  
         "answer": "your detailed answer in **.md** format here",
         "sources": ["source URL1","source URL2"...]
     }}
+    }}
     ```
     """
-    # chain = llm | JsonOutputParser()
-    chain = llm | JsonOutputParser()
+    chain = llm | RobustJsonOutputParser()
     result = await chain.ainvoke(prompt)
-    # result = await llm.ainvoke(prompt)
-    # result = result.content.strip()
-    # result = extract_json(result)
-    # output = result.content.strip()
-    # final_response["answer"] = output
+    print(result)
+    result = result.get("output",{})
     final_response["answer"] = result.get('answer', "")
     final_response["sources"] = result.get('sources',[])
     return final_response

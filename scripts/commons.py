@@ -17,6 +17,7 @@ torch.classes.__path__ = []
 
 load_dotenv() 
 
+
 AZURE_OPENAI_VERSION=os.environ.get("AZURE_OPENAI_VERSION")
 AZURE_OPENAI_DEPLOYMENT=os.environ.get("AZURE_OPENAI_DEPLOYMENT")
 AZURE_OPENAI_ENDPOINT=os.environ.get("AZURE_OPENAI_ENDPOINT")
@@ -36,8 +37,16 @@ gpt_4o = AzureChatOpenAI(
     azure_deployment="gpt-4o",
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
     api_key=AZURE_OPENAI_KEY,
-    temperature=0.7,
+    temperature=0.5,
     )
+
+from langchain_anthropic import ChatAnthropic
+
+haiku = ChatAnthropic(
+    model="claude-3-haiku-20240307",
+    temperature=0.7
+)
+
 
 def convert_chroma_response_to_docs(chroma_response):
     """
