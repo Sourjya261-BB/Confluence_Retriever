@@ -1,7 +1,11 @@
 import streamlit as st
 import asyncio
 import os
-from retrieval_pipeline_final_consolidated import retrieve_docs,gpt_4o
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from retrieval_pipeline_final_consolidated import retrieve_docs
+from commons import gpt_4o
 
 llm = gpt_4o
 
